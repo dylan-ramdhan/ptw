@@ -1,0 +1,2042 @@
+# MODUL 3 — AUTHENTICATION, ROLES, SEEDER & LOGIN
+
+> Buat semua file berikut sesuai path yang tertera.
+> Modul ini menghasilkan: sistem login, role management, seed data awal, dan tampilan login page.
+
+---
+
+## BAGIAN A — SEEDER
+
+### FILE: `src/PTW.JSEA.Infrastructure/Data/DatabaseSeeder.cs`
+```csharp
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Enums;
+
+namespace PTW.JSEA.Infrastructure.Data;
+
+public static class DatabaseSeeder
+{
+    public static readonly string[] SystemRoles = new[]
+    {
+        "SystemAdmin",
+        "SafetyManager",
+        "HSEOfficer",
+        "AreaOwner",
+        "Approver",
+        "Requester",
+        "Auditor"
+    };
+
+    public static async Task SeedAsync(IServiceProvider serviceProvider)
+    {
+        var logger = serviceProvider.GetRequiredService<ILogger<ApplicationDbContext>>();
+
+        try
+        {
+            var context = serviceProvider.GetRequiredService<ApplicationDbContext>();
+            await context.Database.MigrateAsync();
+
+            await SeedRolesAsync(serviceProvider, logger);
+            await SeedUsersAsync(serviceProvider, logger);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error saat seeding database.");
+            throw;
+        }
+    }
+
+    private static async Task SeedRolesAsync(IServiceProvider services, ILogger logger)
+    {
+        var roleManager = services.GetRequiredService<RoleManager<ApplicationRole>>();
+
+        foreach (var roleName in SystemRoles)
+        {
+            if (!await roleManager.RoleExistsAsync(roleName))
+            {
+                var role = new ApplicationRole
+                {
+                    Name = roleName,
+                    Description = GetRoleDescription(roleName),
+                    CreatedAt = DateTime.UtcNow
+                };
+                var result = await roleManager.CreateAsync(role);
+                if (result.Succeeded)
+                    logger.LogInformation("Role created: {Role}", roleName);
+                else
+                    logger.LogError("Failed to create role {Role}: {Errors}", roleName,
+                        string.Join(", ", result.Errors.Select(e => e.Description)));
+            }
+        }
+    }
+
+    private static async Task SeedUsersAsync(IServiceProvider services, ILogger logger)
+    {
+        var userManager = services.GetRequiredService<UserManager<ApplicationUser>>();
+        var context = services.GetRequiredService<ApplicationDbContext>();
+
+        var defaultUsers = new[]
+        {
+            new { Email = "admin@ptw-mattel.com",      FullName = "System Administrator",    Dept = "IT",           Position = "System Admin",     Role = "SystemAdmin",    EmpId = "MAT-ADM-001" },
+            new { Email = "safety@ptw-mattel.com",     FullName = "Safety Manager",          Dept = "HSE",          Position = "Safety Manager",   Role = "SafetyManager",  EmpId = "MAT-HSE-001" },
+            new { Email = "hse@ptw-mattel.com",        FullName = "HSE Officer",             Dept = "HSE",          Position = "HSE Officer",      Role = "HSEOfficer",     EmpId = "MAT-HSE-002" },
+            new { Email = "areaowner@ptw-mattel.com",  FullName = "Area Owner / Supervisor", Dept = "Production",   Position = "Supervisor",       Role = "AreaOwner",      EmpId = "MAT-PRD-001" },
+            new { Email = "approver@ptw-mattel.com",   FullName = "Manager Approver",        Dept = "Operations",   Position = "Manager",          Role = "Approver",       EmpId = "MAT-OPS-001" },
+            new { Email = "requester@ptw-mattel.com",  FullName = "Worker / Requester",      Dept = "Maintenance",  Position = "Technician",       Role = "Requester",      EmpId = "MAT-MNT-001" },
+            new { Email = "auditor@ptw-mattel.com",    FullName = "Internal Auditor",        Dept = "Compliance",   Position = "Auditor",          Role = "Auditor",        EmpId = "MAT-AUD-001" },
+        };
+
+        foreach (var u in defaultUsers)
+        {
+            if (await userManager.FindByEmailAsync(u.Email) == null)
+            {
+                var user = new ApplicationUser
+                {
+                    UserName = u.Email,
+                    Email = u.Email,
+                    FullName = u.FullName,
+                    Department = u.Dept,
+                    Position = u.Position,
+                    EmployeeId = u.EmpId,
+                    IsActive = true,
+                    EmailConfirmed = true,
+                    CreatedAt = DateTime.UtcNow
+                };
+
+                var result = await userManager.CreateAsync(user, "Mattel@123456");
+                if (result.Succeeded)
+                {
+                    await userManager.AddToRoleAsync(user, u.Role);
+                    logger.LogInformation("User seeded: {Email} [{Role}]", u.Email, u.Role);
+                }
+                else
+                {
+                    logger.LogError("Failed to create user {Email}: {Errors}", u.Email,
+                        string.Join(", ", result.Errors.Select(e => e.Description)));
+                }
+            }
+        }
+
+        // Seed sample certificate untuk HSE Officer & Approver
+        await SeedCertificatesAsync(context, userManager, logger);
+    }
+
+    private static async Task SeedCertificatesAsync(
+        ApplicationDbContext context,
+        UserManager<ApplicationUser> userManager,
+        ILogger logger)
+    {
+        if (await context.UserCertificates.AnyAsync()) return;
+
+        var hseUser = await userManager.FindByEmailAsync("hse@ptw-mattel.com");
+        var approverUser = await userManager.FindByEmailAsync("approver@ptw-mattel.com");
+
+        if (hseUser == null || approverUser == null) return;
+
+        var certs = new List<UserCertificate>
+        {
+            // HSE Officer: semua work types
+            new() { UserId = hseUser.Id, WorkType = WorkType.HotWork,           CertificateNumber = "CERT-HW-2024-001", CertificateName = "Hot Work Safety Certificate",           IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = hseUser.Id, WorkType = WorkType.ConfinedSpaceEntry, CertificateNumber = "CERT-CS-2024-001", CertificateName = "Confined Space Entry Certificate",       IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = hseUser.Id, WorkType = WorkType.WorkingAtHeight,    CertificateNumber = "CERT-WH-2024-001", CertificateName = "Working at Height Certificate",          IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = hseUser.Id, WorkType = WorkType.ElectricalIsolation,CertificateNumber = "CERT-EI-2024-001", CertificateName = "Electrical Isolation Certificate",       IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = hseUser.Id, WorkType = WorkType.Excavation,         CertificateNumber = "CERT-EX-2024-001", CertificateName = "Excavation Safety Certificate",          IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = hseUser.Id, WorkType = WorkType.Lifting,            CertificateNumber = "CERT-LF-2024-001", CertificateName = "Lifting Operations Certificate",         IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = hseUser.Id, WorkType = WorkType.ColdWork,           CertificateNumber = "CERT-CW-2024-001", CertificateName = "Cold Work Certificate",                  IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+
+            // Approver: semua work types
+            new() { UserId = approverUser.Id, WorkType = WorkType.HotWork,            CertificateNumber = "CERT-HW-2024-002", CertificateName = "Hot Work Safety Certificate",      IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = approverUser.Id, WorkType = WorkType.ConfinedSpaceEntry,  CertificateNumber = "CERT-CS-2024-002", CertificateName = "Confined Space Entry Certificate", IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = approverUser.Id, WorkType = WorkType.WorkingAtHeight,     CertificateNumber = "CERT-WH-2024-002", CertificateName = "Working at Height Certificate",    IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = approverUser.Id, WorkType = WorkType.ElectricalIsolation, CertificateNumber = "CERT-EI-2024-002", CertificateName = "Electrical Isolation Certificate", IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = approverUser.Id, WorkType = WorkType.Excavation,          CertificateNumber = "CERT-EX-2024-002", CertificateName = "Excavation Safety Certificate",    IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = approverUser.Id, WorkType = WorkType.Lifting,             CertificateNumber = "CERT-LF-2024-002", CertificateName = "Lifting Operations Certificate",   IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+            new() { UserId = approverUser.Id, WorkType = WorkType.ColdWork,            CertificateNumber = "CERT-CW-2024-002", CertificateName = "Cold Work Certificate",            IssuingBody = "BNSP",  IssuedDate = new DateTime(2024,1,1,0,0,0,DateTimeKind.Utc),  ExpiryDate = new DateTime(2026,1,1,0,0,0,DateTimeKind.Utc),  Status = CertificateStatus.Active, CreatedAt = DateTime.UtcNow },
+        };
+
+        context.UserCertificates.AddRange(certs);
+        await context.SaveChangesAsync();
+        logger.LogInformation("Sample certificates seeded: {Count}", certs.Count);
+    }
+
+    private static string GetRoleDescription(string role) => role switch
+    {
+        "SystemAdmin"    => "Administrator sistem dengan akses penuh",
+        "SafetyManager"  => "Monitoring KPI safety dan compliance",
+        "HSEOfficer"     => "Review JSEA, inspeksi lapangan, verifikasi compliance",
+        "AreaOwner"      => "Verifikasi kondisi area kerja dan PAI",
+        "Approver"       => "Persetujuan akhir permit",
+        "Requester"      => "Membuat JSEA dan mengajukan permit",
+        "Auditor"        => "Akses read-only untuk audit trail",
+        _                => string.Empty
+    };
+}
+```
+
+---
+
+## BAGIAN B — APPLICATION LAYER
+
+### FILE: `src/PTW.JSEA.Application/DependencyInjection.cs`
+```csharp
+using Microsoft.Extensions.DependencyInjection;
+using PTW.JSEA.Application.Services;
+
+namespace PTW.JSEA.Application;
+
+public static class DependencyInjection
+{
+    public static IServiceCollection AddApplicationServices(this IServiceCollection services)
+    {
+        services.AddScoped<IWorkPermitService, WorkPermitService>();
+        services.AddScoped<IJSEAService, JSEAService>();
+        services.AddScoped<IAuditService, AuditService>();
+        services.AddScoped<IDashboardService, DashboardService>();
+        services.AddScoped<INotificationService, NotificationService>();
+        services.AddScoped<IFileStorageService, LocalFileStorageService>();
+        return services;
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Application/Services/IAuditService.cs`
+```csharp
+using PTW.JSEA.Domain.Entities;
+
+namespace PTW.JSEA.Application.Services;
+
+public interface IAuditService
+{
+    Task LogAsync(string module, int entityId, string action, string userId,
+        string? oldValue = null, string? newValue = null, string? notes = null);
+    Task<IEnumerable<AuditLog>> GetLogsAsync(string module, int entityId);
+    Task<IEnumerable<AuditLog>> GetRecentLogsAsync(int count = 20);
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Application/Services/AuditService.cs`
+```csharp
+using Microsoft.AspNetCore.Http;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Interfaces.Repositories;
+
+namespace PTW.JSEA.Application.Services;
+
+public class AuditService : IAuditService
+{
+    private readonly IGenericRepository<AuditLog> _auditRepo;
+    private readonly IHttpContextAccessor _httpContextAccessor;
+
+    public AuditService(
+        IGenericRepository<AuditLog> auditRepo,
+        IHttpContextAccessor httpContextAccessor)
+    {
+        _auditRepo = auditRepo;
+        _httpContextAccessor = httpContextAccessor;
+    }
+
+    public async Task LogAsync(string module, int entityId, string action, string userId,
+        string? oldValue = null, string? newValue = null, string? notes = null)
+    {
+        var context = _httpContextAccessor.HttpContext;
+        var log = new AuditLog
+        {
+            Module = module,
+            EntityId = entityId,
+            Action = action,
+            ActionBy = userId,
+            ActionDate = DateTime.UtcNow,
+            OldValue = oldValue,
+            NewValue = newValue,
+            IPAddress = context?.Connection?.RemoteIpAddress?.ToString() ?? "Unknown",
+            Device = context?.Request?.Headers["User-Agent"].ToString()?.Substring(0, Math.Min(200,
+                context?.Request?.Headers["User-Agent"].ToString()?.Length ?? 0)) ?? "Unknown",
+            Notes = notes
+        };
+        await _auditRepo.AddAsync(log);
+    }
+
+    public async Task<IEnumerable<AuditLog>> GetLogsAsync(string module, int entityId)
+        => (await _auditRepo.FindAsync(x => x.Module == module && x.EntityId == entityId))
+            .OrderByDescending(x => x.ActionDate);
+
+    public async Task<IEnumerable<AuditLog>> GetRecentLogsAsync(int count = 20)
+        => (await _auditRepo.GetAllAsync())
+            .OrderByDescending(x => x.ActionDate)
+            .Take(count);
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Application/Services/INotificationService.cs`
+```csharp
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Enums;
+
+namespace PTW.JSEA.Application.Services;
+
+public interface INotificationService
+{
+    Task CreateInAppAsync(string userId, string title, string message,
+        NotificationType type, string? link = null);
+    Task CreateInAppForRoleAsync(string role, string title, string message,
+        NotificationType type, string? link = null);
+    Task<IEnumerable<Notification>> GetUnreadAsync(string userId);
+    Task<int> GetUnreadCountAsync(string userId);
+    Task MarkAsReadAsync(int notificationId, string userId);
+    Task MarkAllAsReadAsync(string userId);
+    Task SendPermitApprovedNotificationAsync(WorkPermit permit);
+    Task SendPermitRejectedNotificationAsync(WorkPermit permit, string reason);
+    Task SendPermitForApprovalNotificationAsync(WorkPermit permit);
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Application/Services/NotificationService.cs`
+```csharp
+using Microsoft.AspNetCore.Identity;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Enums;
+using PTW.JSEA.Domain.Interfaces.Repositories;
+
+namespace PTW.JSEA.Application.Services;
+
+public class NotificationService : INotificationService
+{
+    private readonly IGenericRepository<Notification> _notifRepo;
+    private readonly IUserRepository _userRepo;
+    private readonly UserManager<ApplicationUser> _userManager;
+
+    public NotificationService(
+        IGenericRepository<Notification> notifRepo,
+        IUserRepository userRepo,
+        UserManager<ApplicationUser> userManager)
+    {
+        _notifRepo = notifRepo;
+        _userRepo = userRepo;
+        _userManager = userManager;
+    }
+
+    public async Task CreateInAppAsync(string userId, string title, string message,
+        NotificationType type, string? link = null)
+    {
+        var notif = new Notification
+        {
+            UserId = userId,
+            Title = title,
+            Message = message,
+            Type = type,
+            Link = link,
+            IsRead = false,
+            CreatedAt = DateTime.UtcNow
+        };
+        await _notifRepo.AddAsync(notif);
+    }
+
+    public async Task CreateInAppForRoleAsync(string role, string title, string message,
+        NotificationType type, string? link = null)
+    {
+        var users = await _userRepo.GetByRoleAsync(role);
+        foreach (var user in users)
+            await CreateInAppAsync(user.Id, title, message, type, link);
+    }
+
+    public async Task<IEnumerable<Notification>> GetUnreadAsync(string userId)
+        => await _notifRepo.FindAsync(x => x.UserId == userId && !x.IsRead);
+
+    public async Task<int> GetUnreadCountAsync(string userId)
+        => await _notifRepo.CountAsync(x => x.UserId == userId && !x.IsRead);
+
+    public async Task MarkAsReadAsync(int notificationId, string userId)
+    {
+        var notif = await _notifRepo.GetByIdAsync(notificationId);
+        if (notif != null && notif.UserId == userId)
+        {
+            notif.IsRead = true;
+            notif.ReadAt = DateTime.UtcNow;
+            await _notifRepo.UpdateAsync(notif);
+        }
+    }
+
+    public async Task MarkAllAsReadAsync(string userId)
+    {
+        var unread = await _notifRepo.FindAsync(x => x.UserId == userId && !x.IsRead);
+        foreach (var n in unread)
+        {
+            n.IsRead = true;
+            n.ReadAt = DateTime.UtcNow;
+            await _notifRepo.UpdateAsync(n);
+        }
+    }
+
+    public async Task SendPermitApprovedNotificationAsync(WorkPermit permit)
+    {
+        await CreateInAppAsync(
+            permit.RequesterId,
+            "Permit Disetujui",
+            $"Permit {permit.PermitNumber} telah disetujui dan sekarang aktif.",
+            NotificationType.PermitApproved,
+            $"/Permits/Detail/{permit.Id}");
+    }
+
+    public async Task SendPermitRejectedNotificationAsync(WorkPermit permit, string reason)
+    {
+        await CreateInAppAsync(
+            permit.RequesterId,
+            "Permit Ditolak",
+            $"Permit {permit.PermitNumber} ditolak. Alasan: {reason}",
+            NotificationType.PermitRejected,
+            $"/Permits/Detail/{permit.Id}");
+    }
+
+    public async Task SendPermitForApprovalNotificationAsync(WorkPermit permit)
+    {
+        // Kirim ke HSE Officer untuk review pertama
+        await CreateInAppForRoleAsync(
+            "HSEOfficer",
+            "Permit Baru Menunggu Review",
+            $"Permit {permit.PermitNumber} ({permit.WorkType}) di {permit.Location} menunggu review HSE.",
+            NotificationType.NewPermitForApproval,
+            $"/Permits/Detail/{permit.Id}");
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Application/Services/IFileStorageService.cs`
+```csharp
+using Microsoft.AspNetCore.Http;
+
+namespace PTW.JSEA.Application.Services;
+
+public interface IFileStorageService
+{
+    Task<string> SaveFileAsync(IFormFile file, string subfolder);
+    Task DeleteFileAsync(string filePath);
+    string GetFileUrl(string filePath);
+    bool IsValidFile(IFormFile file, string[] allowedExtensions, int maxSizeMB = 10);
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Application/Services/LocalFileStorageService.cs`
+```csharp
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+
+namespace PTW.JSEA.Application.Services;
+
+public class LocalFileStorageService : IFileStorageService
+{
+    private readonly IWebHostEnvironment _env;
+
+    public LocalFileStorageService(IWebHostEnvironment env)
+        => _env = env;
+
+    public async Task<string> SaveFileAsync(IFormFile file, string subfolder)
+    {
+        var uploadsDir = Path.Combine(_env.WebRootPath, "uploads", subfolder);
+        Directory.CreateDirectory(uploadsDir);
+
+        var uniqueName = $"{Guid.NewGuid()}_{Path.GetFileName(file.FileName)}";
+        var filePath = Path.Combine(uploadsDir, uniqueName);
+
+        using var stream = new FileStream(filePath, FileMode.Create);
+        await file.CopyToAsync(stream);
+
+        return Path.Combine("uploads", subfolder, uniqueName).Replace("\\", "/");
+    }
+
+    public Task DeleteFileAsync(string filePath)
+    {
+        var fullPath = Path.Combine(_env.WebRootPath, filePath);
+        if (File.Exists(fullPath))
+            File.Delete(fullPath);
+        return Task.CompletedTask;
+    }
+
+    public string GetFileUrl(string filePath) => $"/{filePath.Replace("\\", "/")}";
+
+    public bool IsValidFile(IFormFile file, string[] allowedExtensions, int maxSizeMB = 10)
+    {
+        var ext = Path.GetExtension(file.FileName).ToLowerInvariant();
+        var maxBytes = maxSizeMB * 1024 * 1024;
+        return allowedExtensions.Contains(ext) && file.Length <= maxBytes;
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Application/DTOs/DashboardDto.cs`
+```csharp
+namespace PTW.JSEA.Application.DTOs;
+
+public class DashboardStatsDto
+{
+    public int ActivePermitCount { get; set; }
+    public int HighRiskPermitCount { get; set; }
+    public int ActiveWorkerCount { get; set; }
+    public int OverdueAdherenceCount { get; set; }
+    public int PendingApprovalCount { get; set; }
+    public int UnreadNotificationCount { get; set; }
+    public List<ActivePermitDto> ActivePermits { get; set; } = new();
+    public List<RecentActivityDto> RecentActivities { get; set; } = new();
+}
+
+public class ActivePermitDto
+{
+    public int Id { get; set; }
+    public string PermitNumber { get; set; } = string.Empty;
+    public string WorkType { get; set; } = string.Empty;
+    public string Location { get; set; } = string.Empty;
+    public string RequesterName { get; set; } = string.Empty;
+    public int WorkerCount { get; set; }
+    public DateTime EndTime { get; set; }
+    public string RiskLevel { get; set; } = string.Empty;
+    public bool IsExpiringSoon { get; set; }
+}
+
+public class RecentActivityDto
+{
+    public DateTime Timestamp { get; set; }
+    public string Description { get; set; } = string.Empty;
+    public string Module { get; set; } = string.Empty;
+    public string ActionBy { get; set; } = string.Empty;
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Application/Services/IDashboardService.cs`
+```csharp
+using System.Security.Claims;
+using PTW.JSEA.Application.DTOs;
+
+namespace PTW.JSEA.Application.Services;
+
+public interface IDashboardService
+{
+    Task<DashboardStatsDto> GetDashboardStatsAsync(ClaimsPrincipal user);
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Application/Services/DashboardService.cs`
+```csharp
+using System.Security.Claims;
+using Microsoft.AspNetCore.Identity;
+using PTW.JSEA.Application.DTOs;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Enums;
+using PTW.JSEA.Domain.Interfaces.Repositories;
+
+namespace PTW.JSEA.Application.Services;
+
+public class DashboardService : IDashboardService
+{
+    private readonly IWorkPermitRepository _permitRepo;
+    private readonly IGenericRepository<AdherenceLog> _adherenceRepo;
+    private readonly IGenericRepository<PermitApproval> _approvalRepo;
+    private readonly IGenericRepository<AuditLog> _auditRepo;
+    private readonly INotificationService _notificationService;
+    private readonly UserManager<ApplicationUser> _userManager;
+
+    public DashboardService(
+        IWorkPermitRepository permitRepo,
+        IGenericRepository<AdherenceLog> adherenceRepo,
+        IGenericRepository<PermitApproval> approvalRepo,
+        IGenericRepository<AuditLog> auditRepo,
+        INotificationService notificationService,
+        UserManager<ApplicationUser> userManager)
+    {
+        _permitRepo = permitRepo;
+        _adherenceRepo = adherenceRepo;
+        _approvalRepo = approvalRepo;
+        _auditRepo = auditRepo;
+        _notificationService = notificationService;
+        _userManager = userManager;
+    }
+
+    public async Task<DashboardStatsDto> GetDashboardStatsAsync(ClaimsPrincipal userPrincipal)
+    {
+        var userId = _userManager.GetUserId(userPrincipal) ?? string.Empty;
+
+        var activePermits = (await _permitRepo.GetActivePermitsAsync()).ToList();
+
+        // Overdue adherence: permit aktif yang tidak ada adherence log > 4 jam
+        var adherenceThreshold = DateTime.UtcNow.AddHours(-4);
+        var overdueCount = 0;
+        foreach (var p in activePermits)
+        {
+            var lastLog = (await _adherenceRepo.FindAsync(a => a.PermitId == p.Id))
+                .OrderByDescending(a => a.CheckTime).FirstOrDefault();
+            if (lastLog == null || lastLog.CheckTime < adherenceThreshold)
+                overdueCount++;
+        }
+
+        // Pending approvals untuk user ini
+        var pendingApprovals = await _approvalRepo.CountAsync(a =>
+            a.Status == ApprovalStatus.Pending);
+
+        // Unread notifications
+        var unreadCount = await _notificationService.GetUnreadCountAsync(userId);
+
+        // Recent activities
+        var recentLogs = (await _auditRepo.GetAllAsync())
+            .OrderByDescending(x => x.ActionDate)
+            .Take(10)
+            .Select(x => new RecentActivityDto
+            {
+                Timestamp = x.ActionDate,
+                Description = $"{x.Action} — {x.Module} #{x.EntityId}",
+                Module = x.Module,
+                ActionBy = x.ActionBy
+            }).ToList();
+
+        return new DashboardStatsDto
+        {
+            ActivePermitCount = activePermits.Count,
+            HighRiskPermitCount = await _permitRepo.GetHighRiskCountAsync(),
+            ActiveWorkerCount = activePermits.Sum(p => p.Workers.Count(w => w.CheckInTime.HasValue && !w.CheckOutTime.HasValue)),
+            OverdueAdherenceCount = overdueCount,
+            PendingApprovalCount = pendingApprovals,
+            UnreadNotificationCount = unreadCount,
+            ActivePermits = activePermits.Select(p => new ActivePermitDto
+            {
+                Id = p.Id,
+                PermitNumber = p.PermitNumber,
+                WorkType = p.WorkType.ToString(),
+                Location = p.Location,
+                RequesterName = p.Requester?.FullName ?? "-",
+                WorkerCount = p.Workers.Count,
+                EndTime = p.EndTime,
+                RiskLevel = p.RiskLevel.ToString(),
+                IsExpiringSoon = p.IsExpiringSoon
+            }).ToList(),
+            RecentActivities = recentLogs
+        };
+    }
+}
+```
+
+---
+
+## BAGIAN C — WEB LAYER: Program.cs
+
+### FILE: `src/PTW.JSEA.Web/Program.cs`
+```csharp
+using Microsoft.AspNetCore.Identity;
+using PTW.JSEA.Application;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Infrastructure;
+using PTW.JSEA.Infrastructure.Data;
+using PTW.JSEA.Web.Hubs;
+using Serilog;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// ─── Serilog ─────────────────────────────────────────────────────────────────
+Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Information()
+    .MinimumLevel.Override("Microsoft", Serilog.Events.LogEventLevel.Warning)
+    .MinimumLevel.Override("System", Serilog.Events.LogEventLevel.Warning)
+    .Enrich.FromLogContext()
+    .WriteTo.Console()
+    .WriteTo.File("logs/ptw-.log",
+        rollingInterval: RollingInterval.Day,
+        retainedFileCountLimit: 30)
+    .CreateLogger();
+builder.Host.UseSerilog();
+
+// ─── Database & Infrastructure ───────────────────────────────────────────────
+builder.Services.AddInfrastructureServices(builder.Configuration);
+
+// ─── Identity ────────────────────────────────────────────────────────────────
+builder.Services.AddIdentity<ApplicationUser, ApplicationRole>(options =>
+{
+    options.Password.RequireDigit = true;
+    options.Password.RequireLowercase = true;
+    options.Password.RequireUppercase = true;
+    options.Password.RequireNonAlphanumeric = true;
+    options.Password.RequiredLength = 8;
+    options.Lockout.MaxFailedAccessAttempts = 5;
+    options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(15);
+    options.Lockout.AllowedForNewUsers = true;
+    options.User.RequireUniqueEmail = true;
+})
+.AddEntityFrameworkStores<ApplicationDbContext>()
+.AddDefaultTokenProviders();
+
+// ─── Cookie / Session ────────────────────────────────────────────────────────
+builder.Services.ConfigureApplicationCookie(options =>
+{
+    options.LoginPath = "/Account/Login";
+    options.LogoutPath = "/Account/Logout";
+    options.AccessDeniedPath = "/Account/AccessDenied";
+    options.ExpireTimeSpan = TimeSpan.FromHours(8);
+    options.SlidingExpiration = true;
+    options.Cookie.HttpOnly = true;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+});
+
+// ─── Application Services ────────────────────────────────────────────────────
+builder.Services.AddApplicationServices();
+
+// ─── SignalR ─────────────────────────────────────────────────────────────────
+builder.Services.AddSignalR();
+
+// ─── Razor Pages ─────────────────────────────────────────────────────────────
+builder.Services.AddRazorPages(options =>
+{
+    options.Conventions.AuthorizeFolder("/");
+    options.Conventions.AuthorizeFolder("/Admin", "RequireAdminRole");
+    options.Conventions.AllowAnonymousToPage("/Account/Login");
+    options.Conventions.AllowAnonymousToPage("/Account/AccessDenied");
+});
+
+// ─── Authorization Policies ──────────────────────────────────────────────────
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("RequireAdminRole",
+        policy => policy.RequireRole("SystemAdmin"));
+    options.AddPolicy("RequireHSEOrAdmin",
+        policy => policy.RequireRole("SystemAdmin", "SafetyManager", "HSEOfficer"));
+    options.AddPolicy("RequireApproverRole",
+        policy => policy.RequireRole("SystemAdmin", "SafetyManager", "HSEOfficer", "AreaOwner", "Approver"));
+    options.AddPolicy("NotAuditor",
+        policy => policy.RequireRole("SystemAdmin", "SafetyManager", "HSEOfficer", "AreaOwner", "Approver", "Requester"));
+});
+
+// ─── Antiforgery ─────────────────────────────────────────────────────────────
+builder.Services.AddAntiforgery(options => options.HeaderName = "X-CSRF-TOKEN");
+
+// ─── HttpContext Accessor ─────────────────────────────────────────────────────
+builder.Services.AddHttpContextAccessor();
+
+var app = builder.Build();
+
+// ─── Pipeline ────────────────────────────────────────────────────────────────
+if (!app.Environment.IsDevelopment())
+{
+    app.UseExceptionHandler("/Error");
+    app.UseHsts();
+}
+
+app.UseHttpsRedirection();
+app.UseStaticFiles();
+app.UseSerilogRequestLogging();
+app.UseRouting();
+app.UseAuthentication();
+app.UseAuthorization();
+
+// ─── SignalR Hub ──────────────────────────────────────────────────────────────
+app.MapHub<PermitHub>("/hubs/permit");
+
+// ─── Razor Pages ─────────────────────────────────────────────────────────────
+app.MapRazorPages();
+
+// ─── API Endpoints (untuk AJAX calls) ────────────────────────────────────────
+app.MapGet("/api/notifications/count", async (
+    Microsoft.AspNetCore.Identity.UserManager<ApplicationUser> um,
+    PTW.JSEA.Application.Services.INotificationService ns,
+    System.Security.Claims.ClaimsPrincipal user) =>
+{
+    var userId = um.GetUserId(user);
+    if (userId == null) return Results.Unauthorized();
+    var count = await ns.GetUnreadCountAsync(userId);
+    return Results.Ok(new { count });
+}).RequireAuthorization();
+
+app.MapPost("/api/notifications/{id}/read", async (
+    int id,
+    Microsoft.AspNetCore.Identity.UserManager<ApplicationUser> um,
+    PTW.JSEA.Application.Services.INotificationService ns,
+    System.Security.Claims.ClaimsPrincipal user) =>
+{
+    var userId = um.GetUserId(user);
+    if (userId == null) return Results.Unauthorized();
+    await ns.MarkAsReadAsync(id, userId);
+    return Results.Ok();
+}).RequireAuthorization();
+
+// ─── Database Seed ────────────────────────────────────────────────────────────
+using (var scope = app.Services.CreateScope())
+{
+    await DatabaseSeeder.SeedAsync(scope.ServiceProvider);
+}
+
+app.Run();
+```
+
+---
+
+## BAGIAN D — SIGNALR HUB (stub untuk compile)
+
+### FILE: `src/PTW.JSEA.Web/Hubs/PermitHub.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.SignalR;
+
+namespace PTW.JSEA.Web.Hubs;
+
+[Authorize]
+public class PermitHub : Hub
+{
+    public async Task JoinDashboardGroup()
+        => await Groups.AddToGroupAsync(Context.ConnectionId, "Dashboard");
+
+    public async Task LeaveDashboardGroup()
+        => await Groups.RemoveFromGroupAsync(Context.ConnectionId, "Dashboard");
+
+    public async Task JoinPermitGroup(int permitId)
+        => await Groups.AddToGroupAsync(Context.ConnectionId, $"Permit_{permitId}");
+
+    public async Task LeavePermitGroup(int permitId)
+        => await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"Permit_{permitId}");
+
+    public override async Task OnConnectedAsync()
+    {
+        await base.OnConnectedAsync();
+    }
+
+    public override async Task OnDisconnectedAsync(Exception? exception)
+    {
+        await base.OnDisconnectedAsync(exception);
+    }
+}
+```
+
+---
+
+## BAGIAN E — PAGES: Login
+
+### FILE: `src/PTW.JSEA.Web/Pages/Account/Login.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+using PTW.JSEA.Domain.Entities;
+using System.ComponentModel.DataAnnotations;
+
+namespace PTW.JSEA.Web.Pages.Account;
+
+public class LoginModel : PageModel
+{
+    private readonly SignInManager<ApplicationUser> _signInManager;
+    private readonly UserManager<ApplicationUser> _userManager;
+    private readonly ILogger<LoginModel> _logger;
+
+    public LoginModel(
+        SignInManager<ApplicationUser> signInManager,
+        UserManager<ApplicationUser> userManager,
+        ILogger<LoginModel> logger)
+    {
+        _signInManager = signInManager;
+        _userManager = userManager;
+        _logger = logger;
+    }
+
+    [BindProperty]
+    public InputModel Input { get; set; } = new();
+
+    public string? ReturnUrl { get; set; }
+
+    [TempData]
+    public string? ErrorMessage { get; set; }
+
+    public class InputModel
+    {
+        [Required(ErrorMessage = "Email wajib diisi")]
+        [EmailAddress(ErrorMessage = "Format email tidak valid")]
+        public string Email { get; set; } = string.Empty;
+
+        [Required(ErrorMessage = "Password wajib diisi")]
+        [DataType(DataType.Password)]
+        public string Password { get; set; } = string.Empty;
+
+        [Display(Name = "Remember me")]
+        public bool RememberMe { get; set; }
+    }
+
+    public async Task OnGetAsync(string? returnUrl = null)
+    {
+        if (!string.IsNullOrEmpty(ErrorMessage))
+            ModelState.AddModelError(string.Empty, ErrorMessage);
+
+        ReturnUrl = returnUrl ?? Url.Content("~/Dashboard");
+        await HttpContext.SignOutAsync(IdentityConstants.ExternalScheme);
+    }
+
+    public async Task<IActionResult> OnPostAsync(string? returnUrl = null)
+    {
+        returnUrl ??= Url.Content("~/Dashboard");
+
+        if (!ModelState.IsValid) return Page();
+
+        var user = await _userManager.FindByEmailAsync(Input.Email);
+        if (user == null || !user.IsActive)
+        {
+            ModelState.AddModelError(string.Empty, "Email atau password tidak valid.");
+            return Page();
+        }
+
+        var result = await _signInManager.PasswordSignInAsync(
+            Input.Email, Input.Password, Input.RememberMe, lockoutOnFailure: true);
+
+        if (result.Succeeded)
+        {
+            // Update last login
+            user.LastLoginAt = DateTime.UtcNow;
+            await _userManager.UpdateAsync(user);
+
+            _logger.LogInformation("User {Email} login berhasil.", Input.Email);
+            return LocalRedirect(returnUrl);
+        }
+
+        if (result.IsLockedOut)
+        {
+            _logger.LogWarning("User {Email} terkunci karena banyak percobaan login gagal.", Input.Email);
+            ModelState.AddModelError(string.Empty,
+                "Akun terkunci sementara karena terlalu banyak percobaan login. Coba lagi dalam 15 menit.");
+            return Page();
+        }
+
+        ModelState.AddModelError(string.Empty, "Email atau password tidak valid.");
+        return Page();
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Account/Login.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Account.LoginModel
+@{
+    Layout = null;
+    ViewData["Title"] = "Login";
+}
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Login — PTW & JSEA System</title>
+    <link rel="stylesheet" href="~/css/output.css" />
+</head>
+<body class="min-h-screen bg-gradient-to-br from-slate-900 via-blue-950 to-slate-900 flex items-center justify-center p-4">
+
+    <div class="w-full max-w-md">
+
+        <!-- Logo & Header -->
+        <div class="text-center mb-8">
+            <div class="inline-flex items-center justify-center w-20 h-20 bg-blue-600 rounded-2xl shadow-xl mb-4">
+                <svg class="w-10 h-10 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+                </svg>
+            </div>
+            <h1 class="text-3xl font-bold text-white tracking-tight">PTW & JSEA System</h1>
+            <p class="text-blue-300 text-sm mt-1 font-medium">PT. Mattel Indonesia</p>
+        </div>
+
+        <!-- Card -->
+        <div class="bg-white rounded-2xl shadow-2xl p-8">
+            <h2 class="text-xl font-semibold text-gray-800 mb-6">Masuk ke Sistem</h2>
+
+            <!-- Validation summary -->
+            @if (!ViewData.ModelState.IsValid)
+            {
+                <div class="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-5 text-sm flex items-start gap-2">
+                    <svg class="w-4 h-4 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"/>
+                    </svg>
+                    <div asp-validation-summary="ModelOnly"></div>
+                </div>
+            }
+
+            <form method="post">
+                @Html.AntiForgeryToken()
+
+                <!-- Email -->
+                <div class="mb-5">
+                    <label asp-for="Input.Email" class="block text-sm font-medium text-gray-700 mb-1.5">
+                        Alamat Email
+                    </label>
+                    <input asp-for="Input.Email"
+                           type="email"
+                           autocomplete="email"
+                           class="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm
+                                  focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500
+                                  transition duration-150"
+                           placeholder="email@mattel.com" />
+                    <span asp-validation-for="Input.Email" class="text-red-500 text-xs mt-1 block"></span>
+                </div>
+
+                <!-- Password -->
+                <div class="mb-5">
+                    <div class="flex items-center justify-between mb-1.5">
+                        <label asp-for="Input.Password" class="block text-sm font-medium text-gray-700">
+                            Password
+                        </label>
+                    </div>
+                    <div class="relative">
+                        <input asp-for="Input.Password"
+                               id="passwordInput"
+                               type="password"
+                               autocomplete="current-password"
+                               class="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm pr-10
+                                      focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500
+                                      transition duration-150" />
+                        <button type="button"
+                                onclick="togglePassword()"
+                                class="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600">
+                            <svg id="eyeIcon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <span asp-validation-for="Input.Password" class="text-red-500 text-xs mt-1 block"></span>
+                </div>
+
+                <!-- Remember me -->
+                <div class="flex items-center justify-between mb-6">
+                    <label class="flex items-center gap-2 text-sm text-gray-600 cursor-pointer">
+                        <input asp-for="Input.RememberMe"
+                               type="checkbox"
+                               class="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
+                        Ingat saya
+                    </label>
+                </div>
+
+                <!-- Submit -->
+                <button type="submit"
+                        class="w-full bg-blue-600 hover:bg-blue-700 active:bg-blue-800
+                               text-white font-semibold py-3 rounded-lg
+                               transition duration-200 focus:outline-none focus:ring-2
+                               focus:ring-blue-500 focus:ring-offset-2 text-sm">
+                    Masuk
+                </button>
+            </form>
+        </div>
+
+        <!-- Footer note -->
+        <p class="text-center text-blue-300 text-xs mt-6">
+            Sistem Permit To Work & JSEA — v1.0.0<br/>
+            Hubungi IT Support jika membutuhkan bantuan akses.
+        </p>
+    </div>
+
+    <script>
+        function togglePassword() {
+            const input = document.getElementById('passwordInput');
+            input.type = input.type === 'password' ? 'text' : 'password';
+        }
+    </script>
+</body>
+</html>
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Account/Logout.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+using PTW.JSEA.Domain.Entities;
+
+namespace PTW.JSEA.Web.Pages.Account;
+
+public class LogoutModel : PageModel
+{
+    private readonly SignInManager<ApplicationUser> _signInManager;
+    private readonly ILogger<LogoutModel> _logger;
+
+    public LogoutModel(SignInManager<ApplicationUser> signInManager, ILogger<LogoutModel> logger)
+    {
+        _signInManager = signInManager;
+        _logger = logger;
+    }
+
+    public async Task<IActionResult> OnPostAsync()
+    {
+        await _signInManager.SignOutAsync();
+        _logger.LogInformation("User logged out.");
+        return RedirectToPage("/Account/Login");
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Account/Logout.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Account.LogoutModel
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Account/AccessDenied.cshtml`
+```html
+@page
+@{
+    Layout = null;
+    ViewData["Title"] = "Akses Ditolak";
+}
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="utf-8"/>
+    <title>Akses Ditolak</title>
+    <link rel="stylesheet" href="~/css/output.css"/>
+</head>
+<body class="min-h-screen bg-gray-50 flex items-center justify-center">
+    <div class="text-center p-8">
+        <div class="text-6xl mb-4">🚫</div>
+        <h1 class="text-2xl font-bold text-gray-800 mb-2">Akses Ditolak</h1>
+        <p class="text-gray-500 mb-6">Anda tidak memiliki izin untuk mengakses halaman ini.</p>
+        <a href="/Dashboard" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 transition">
+            Kembali ke Dashboard
+        </a>
+    </div>
+</body>
+</html>
+```
+
+---
+
+## BAGIAN F — LAYOUT DASAR
+
+### FILE: `src/PTW.JSEA.Web/Pages/Shared/_Layout.cshtml`
+```html
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>@ViewData["Title"] — PTW & JSEA System</title>
+    <link rel="stylesheet" href="~/css/output.css" asp-append-version="true"/>
+    <meta name="csrf-token" content="@Antiforgery.GetAndStoreTokens(HttpContext).RequestToken"/>
+</head>
+<body class="bg-gray-50 font-sans antialiased">
+
+<div class="flex h-screen overflow-hidden">
+
+    <!-- ═══ SIDEBAR ═══════════════════════════════════════════════════════ -->
+    <aside id="sidebar"
+           class="w-64 bg-slate-900 text-white flex flex-col flex-shrink-0 shadow-xl">
+
+        <!-- Brand -->
+        <div class="px-5 py-4 border-b border-slate-700">
+            <div class="flex items-center gap-3">
+                <div class="w-9 h-9 bg-blue-600 rounded-lg flex items-center justify-center flex-shrink-0">
+                    <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+                    </svg>
+                </div>
+                <div>
+                    <p class="font-bold text-sm leading-tight">PTW & JSEA</p>
+                    <p class="text-slate-400 text-xs">PT. Mattel Indonesia</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Navigation -->
+        <nav class="flex-1 overflow-y-auto py-4 px-3 space-y-0.5">
+
+            <!-- Dashboard -->
+            <a asp-page="/Dashboard/Index"
+               class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+                </svg>
+                Dashboard
+            </a>
+
+            <!-- JSEA section -->
+            <div class="pt-4 pb-1">
+                <p class="text-slate-500 text-xs font-semibold uppercase tracking-wider px-3">JSEA</p>
+            </div>
+            <a asp-page="/JSEA/Index"
+               class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+                </svg>
+                Daftar JSEA
+            </a>
+            <a asp-page="/JSEA/Create"
+               class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+                </svg>
+                Buat JSEA
+            </a>
+
+            <!-- Permit section -->
+            <div class="pt-4 pb-1">
+                <p class="text-slate-500 text-xs font-semibold uppercase tracking-wider px-3">PERMIT</p>
+            </div>
+            <a asp-page="/Permits/Index"
+               class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2"/>
+                </svg>
+                Daftar Permit
+            </a>
+            <a asp-page="/Permits/Create"
+               class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+                </svg>
+                Buat Permit
+            </a>
+            <a asp-page="/Permits/MyApprovals"
+               class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+                Approval Queue
+            </a>
+
+            <!-- Monitoring -->
+            <div class="pt-4 pb-1">
+                <p class="text-slate-500 text-xs font-semibold uppercase tracking-wider px-3">MONITORING</p>
+            </div>
+            <a asp-page="/Monitoring/Active"
+               class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+                </svg>
+                Active Work
+            </a>
+            <a asp-page="/Reports/Index"
+               class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+                </svg>
+                Reports & Analytics
+            </a>
+
+            <!-- Admin (SystemAdmin only) -->
+            @if (User.IsInRole("SystemAdmin") || User.IsInRole("SafetyManager"))
+            {
+                <div class="pt-4 pb-1">
+                    <p class="text-slate-500 text-xs font-semibold uppercase tracking-wider px-3">ADMIN</p>
+                </div>
+                <a asp-page="/Admin/Users/Index"
+                   class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                    <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/>
+                    </svg>
+                    Manajemen User
+                </a>
+                <a asp-page="/Admin/Certificates/Index"
+                   class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                    <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                    </svg>
+                    Sertifikasi
+                </a>
+                <a asp-page="/Admin/AuditTrail/Index"
+                   class="nav-item flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-800 hover:text-white transition-colors">
+                    <svg class="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/>
+                    </svg>
+                    Audit Trail
+                </a>
+            }
+        </nav>
+
+        <!-- User panel bottom -->
+        <div class="px-4 py-3 border-t border-slate-700 bg-slate-800/50">
+            <div class="flex items-center gap-3">
+                <div class="w-8 h-8 bg-blue-600 rounded-full flex items-center justify-center flex-shrink-0">
+                    <span class="text-white text-xs font-bold">
+                        @(User.Identity?.Name?.Substring(0, 1).ToUpper() ?? "U")
+                    </span>
+                </div>
+                <div class="flex-1 min-w-0">
+                    <p class="text-white text-xs font-medium truncate">@User.Identity?.Name</p>
+                    <p class="text-slate-400 text-xs truncate">
+                        @(User.IsInRole("SystemAdmin") ? "System Admin" :
+                          User.IsInRole("HSEOfficer") ? "HSE Officer" :
+                          User.IsInRole("AreaOwner") ? "Area Owner" :
+                          User.IsInRole("Approver") ? "Approver" :
+                          User.IsInRole("SafetyManager") ? "Safety Manager" :
+                          User.IsInRole("Auditor") ? "Auditor" : "Requester")
+                    </p>
+                </div>
+                <form asp-page="/Account/Logout" method="post">
+                    @Html.AntiForgeryToken()
+                    <button type="submit"
+                            title="Sign out"
+                            class="text-slate-400 hover:text-white transition-colors p-1">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+                        </svg>
+                    </button>
+                </form>
+            </div>
+        </div>
+    </aside>
+
+    <!-- ═══ MAIN CONTENT ══════════════════════════════════════════════════ -->
+    <div class="flex-1 flex flex-col overflow-hidden">
+
+        <!-- Top header -->
+        <header class="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between flex-shrink-0">
+            <div>
+                <h1 class="text-lg font-semibold text-gray-900">@ViewData["Title"]</h1>
+                @if (ViewData["Subtitle"] != null)
+                {
+                    <p class="text-sm text-gray-500">@ViewData["Subtitle"]</p>
+                }
+            </div>
+            <div class="flex items-center gap-4">
+                <!-- Notification bell -->
+                <div class="relative">
+                    <button id="notifBtn"
+                            onclick="toggleNotifDropdown()"
+                            class="relative p-2 text-gray-500 hover:text-blue-600 hover:bg-gray-100 rounded-lg transition-colors">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/>
+                        </svg>
+                        <span id="notifBadge"
+                              class="absolute top-1 right-1 w-4 h-4 bg-red-500 text-white text-xs
+                                     rounded-full hidden items-center justify-center font-bold"></span>
+                    </button>
+
+                    <!-- Notification dropdown -->
+                    <div id="notifDropdown"
+                         class="hidden absolute right-0 top-full mt-2 w-80 bg-white rounded-xl shadow-xl
+                                border border-gray-100 z-50 overflow-hidden">
+                        <div class="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
+                            <p class="font-semibold text-gray-800 text-sm">Notifikasi</p>
+                            <button onclick="markAllRead()" class="text-xs text-blue-600 hover:underline">
+                                Tandai semua dibaca
+                            </button>
+                        </div>
+                        <div id="notifList" class="max-h-80 overflow-y-auto divide-y divide-gray-50">
+                            <p class="text-center text-gray-400 text-sm py-6">Memuat...</p>
+                        </div>
+                        <div class="px-4 py-2 border-t border-gray-100 text-center">
+                            <a href="#" class="text-xs text-blue-600 hover:underline">Lihat semua notifikasi</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Page content -->
+        <main class="flex-1 overflow-y-auto p-6">
+            <!-- Breadcrumb -->
+            @if (ViewData["Breadcrumb"] != null)
+            {
+                <nav class="mb-4 text-sm text-gray-500" aria-label="Breadcrumb">
+                    @Html.Raw(ViewData["Breadcrumb"])
+                </nav>
+            }
+
+            @RenderBody()
+        </main>
+    </div>
+</div>
+
+<!-- Toast container -->
+<div id="toastContainer" class="fixed bottom-4 right-4 z-50 space-y-2"></div>
+
+<!-- SignalR -->
+<script src="~/lib/signalr/signalr.min.js"></script>
+<script src="~/js/site.js" asp-append-version="true"></script>
+
+@await RenderSectionAsync("Scripts", required: false)
+
+<style>
+.nav-item.active {
+    @apply bg-blue-700 text-white;
+}
+</style>
+
+<script>
+// Active nav highlight
+document.querySelectorAll('.nav-item').forEach(link => {
+    if (link.href && window.location.pathname.startsWith(new URL(link.href).pathname) &&
+        new URL(link.href).pathname !== '/') {
+        link.classList.add('bg-slate-700', 'text-white');
+    }
+});
+
+// Notification dropdown
+function toggleNotifDropdown() {
+    const dd = document.getElementById('notifDropdown');
+    dd.classList.toggle('hidden');
+    if (!dd.classList.contains('hidden')) loadNotifications();
+}
+
+document.addEventListener('click', (e) => {
+    const btn = document.getElementById('notifBtn');
+    const dd = document.getElementById('notifDropdown');
+    if (!btn.contains(e.target) && !dd.contains(e.target)) {
+        dd.classList.add('hidden');
+    }
+});
+
+async function loadNotifications() {
+    try {
+        const res = await fetch('/api/notifications/unread');
+        if (!res.ok) return;
+        const notifs = await res.json();
+        const list = document.getElementById('notifList');
+        if (notifs.length === 0) {
+            list.innerHTML = '<p class="text-center text-gray-400 text-sm py-6">Tidak ada notifikasi baru</p>';
+            return;
+        }
+        list.innerHTML = notifs.map(n => `
+            <div class="px-4 py-3 hover:bg-gray-50 cursor-pointer ${!n.isRead ? 'bg-blue-50' : ''}"
+                 onclick="readNotif(${n.id}, '${n.link}')">
+                <p class="text-sm font-medium text-gray-800">${n.title}</p>
+                <p class="text-xs text-gray-500 mt-0.5">${n.message}</p>
+                <p class="text-xs text-gray-400 mt-1">${new Date(n.createdAt).toLocaleString('id-ID')}</p>
+            </div>
+        `).join('');
+    } catch(e) { console.error(e); }
+}
+
+async function readNotif(id, link) {
+    await fetch(`/api/notifications/${id}/read`, { method: 'POST', headers: {'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || ''} });
+    if (link) window.location.href = link;
+    loadNotifications();
+    loadNotifCount();
+}
+
+async function markAllRead() {
+    await fetch('/api/notifications/read-all', { method: 'POST', headers: {'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content || ''} });
+    loadNotifications();
+    loadNotifCount();
+}
+
+async function loadNotifCount() {
+    try {
+        const res = await fetch('/api/notifications/count');
+        if (!res.ok) return;
+        const data = await res.json();
+        const badge = document.getElementById('notifBadge');
+        if (data.count > 0) {
+            badge.textContent = data.count > 99 ? '99+' : data.count;
+            badge.classList.remove('hidden');
+            badge.classList.add('flex');
+        } else {
+            badge.classList.add('hidden');
+            badge.classList.remove('flex');
+        }
+    } catch(e) {}
+}
+
+// Load count on page load
+loadNotifCount();
+setInterval(loadNotifCount, 30000); // refresh setiap 30 detik
+
+// Toast utility (dipakai SignalR & halaman lain)
+function showToast(message, type = 'info', duration = 4000) {
+    const colors = {
+        info: 'bg-blue-600',
+        success: 'bg-green-600',
+        warning: 'bg-yellow-500',
+        error: 'bg-red-600',
+        emergency: 'bg-red-800'
+    };
+    const icons = {
+        info: 'ℹ️',
+        success: '✅',
+        warning: '⚠️',
+        error: '❌',
+        emergency: '🚨'
+    };
+    const toast = document.createElement('div');
+    toast.className = `${colors[type]} text-white px-4 py-3 rounded-lg shadow-lg flex items-center gap-2 text-sm max-w-sm transform transition-all duration-300 translate-y-2 opacity-0`;
+    toast.innerHTML = `<span>${icons[type]}</span><span>${message}</span>`;
+    document.getElementById('toastContainer').appendChild(toast);
+    requestAnimationFrame(() => {
+        toast.classList.remove('translate-y-2', 'opacity-0');
+    });
+    setTimeout(() => {
+        toast.classList.add('opacity-0');
+        setTimeout(() => toast.remove(), 300);
+    }, duration);
+}
+</script>
+</body>
+</html>
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Shared/_ViewImports.cshtml`
+```html
+@using PTW.JSEA.Web
+@using PTW.JSEA.Web.Pages
+@using PTW.JSEA.Domain.Enums
+@using PTW.JSEA.Application.DTOs
+@namespace PTW.JSEA.Web.Pages
+@addTagHelper *, Microsoft.AspNetCore.Mvc.TagHelpers
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Shared/_ViewStart.cshtml`
+```html
+@{
+    Layout = "_Layout";
+}
+```
+
+---
+
+## BAGIAN G — PLACEHOLDER PAGES (agar tidak error saat build)
+
+Buat file-file kosong berikut agar tidak ada error "page not found":
+
+### FILE: `src/PTW.JSEA.Web/Pages/Dashboard/Index.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Dashboard.IndexModel
+@{
+    ViewData["Title"] = "Dashboard";
+}
+<p class="text-gray-500">Dashboard — segera diisi di Modul berikutnya.</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Dashboard/Index.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+
+namespace PTW.JSEA.Web.Pages.Dashboard;
+
+[Authorize]
+public class IndexModel : PageModel
+{
+    public void OnGet() { }
+}
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/JSEA/Index.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.JSEA.IndexModel
+@{ ViewData["Title"] = "Daftar JSEA"; }
+<p class="text-gray-500">Coming soon — Modul 5</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/JSEA/Index.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+namespace PTW.JSEA.Web.Pages.JSEA;
+[Authorize] public class IndexModel : PageModel { public void OnGet() { } }
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/JSEA/Create.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.JSEA.CreateModel
+@{ ViewData["Title"] = "Buat JSEA"; }
+<p class="text-gray-500">Coming soon — Modul 5</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/JSEA/Create.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+namespace PTW.JSEA.Web.Pages.JSEA;
+[Authorize] public class CreateModel : PageModel { public void OnGet() { } }
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Index.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Permits.IndexModel
+@{ ViewData["Title"] = "Daftar Permit"; }
+<p class="text-gray-500">Coming soon — Modul 6</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Index.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+namespace PTW.JSEA.Web.Pages.Permits;
+[Authorize] public class IndexModel : PageModel { public void OnGet() { } }
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Create.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Permits.CreateModel
+@{ ViewData["Title"] = "Buat Permit"; }
+<p class="text-gray-500">Coming soon — Modul 6</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Create.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+namespace PTW.JSEA.Web.Pages.Permits;
+[Authorize] public class CreateModel : PageModel { public void OnGet() { } }
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/MyApprovals.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Permits.MyApprovalsModel
+@{ ViewData["Title"] = "Approval Queue"; }
+<p class="text-gray-500">Coming soon — Modul 7</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/MyApprovals.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+namespace PTW.JSEA.Web.Pages.Permits;
+[Authorize] public class MyApprovalsModel : PageModel { public void OnGet() { } }
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Monitoring/Active.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Monitoring.ActiveModel
+@{ ViewData["Title"] = "Active Work"; }
+<p class="text-gray-500">Coming soon — Modul 9</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Monitoring/Active.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+namespace PTW.JSEA.Web.Pages.Monitoring;
+[Authorize] public class ActiveModel : PageModel { public void OnGet() { } }
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Reports/Index.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Reports.IndexModel
+@{ ViewData["Title"] = "Reports & Analytics"; }
+<p class="text-gray-500">Coming soon — Modul 12</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Reports/Index.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+namespace PTW.JSEA.Web.Pages.Reports;
+[Authorize] public class IndexModel : PageModel { public void OnGet() { } }
+```
+
+### Buat folder Admin dan placeholder:
+```bash
+mkdir src\PTW.JSEA.Web\Pages\Admin\Users
+mkdir src\PTW.JSEA.Web\Pages\Admin\Certificates
+mkdir src\PTW.JSEA.Web\Pages\Admin\AuditTrail
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Admin/Users/Index.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Admin.Users.IndexModel
+@{ ViewData["Title"] = "Manajemen User"; }
+<p class="text-gray-500">Coming soon — Modul 13</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Admin/Users/Index.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+namespace PTW.JSEA.Web.Pages.Admin.Users;
+[Authorize(Roles = "SystemAdmin,SafetyManager")] public class IndexModel : PageModel { public void OnGet() { } }
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Admin/Certificates/Index.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Admin.Certificates.IndexModel
+@{ ViewData["Title"] = "Manajemen Sertifikasi"; }
+<p class="text-gray-500">Coming soon — Modul 13</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Admin/Certificates/Index.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+namespace PTW.JSEA.Web.Pages.Admin.Certificates;
+[Authorize(Roles = "SystemAdmin,SafetyManager,HSEOfficer")] public class IndexModel : PageModel { public void OnGet() { } }
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Admin/AuditTrail/Index.cshtml`
+```html
+@page
+@model PTW.JSEA.Web.Pages.Admin.AuditTrail.IndexModel
+@{ ViewData["Title"] = "Audit Trail"; }
+<p class="text-gray-500">Coming soon — Modul 12</p>
+```
+
+### FILE: `src/PTW.JSEA.Web/Pages/Admin/AuditTrail/Index.cshtml.cs`
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+namespace PTW.JSEA.Web.Pages.Admin.AuditTrail;
+[Authorize(Roles = "SystemAdmin,SafetyManager,Auditor")] public class IndexModel : PageModel { public void OnGet() { } }
+```
+
+---
+
+## BAGIAN H — TAILWINDCSS SETUP
+
+### FILE: `src/PTW.JSEA.Web/tailwind.config.js`
+```javascript
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    './Pages/**/*.cshtml',
+    './Views/**/*.cshtml',
+    './wwwroot/js/**/*.js'
+  ],
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: ['Inter', 'system-ui', 'sans-serif'],
+      },
+    },
+  },
+  plugins: [
+    require('@tailwindcss/forms'),
+  ],
+}
+```
+
+### FILE: `src/PTW.JSEA.Web/wwwroot/css/app.css`
+```css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body { @apply text-gray-900; }
+}
+
+@layer components {
+  /* Buttons */
+  .btn { @apply inline-flex items-center justify-center gap-2 font-semibold rounded-lg px-4 py-2 text-sm transition-colors duration-150 focus:outline-none focus:ring-2 focus:ring-offset-1 disabled:opacity-50 disabled:cursor-not-allowed; }
+  .btn-primary { @apply btn bg-blue-600 hover:bg-blue-700 text-white focus:ring-blue-500; }
+  .btn-secondary { @apply btn bg-gray-100 hover:bg-gray-200 text-gray-700 focus:ring-gray-400; }
+  .btn-success { @apply btn bg-green-600 hover:bg-green-700 text-white focus:ring-green-500; }
+  .btn-danger { @apply btn bg-red-600 hover:bg-red-700 text-white focus:ring-red-500; }
+  .btn-warning { @apply btn bg-yellow-500 hover:bg-yellow-600 text-white focus:ring-yellow-400; }
+  .btn-outline { @apply btn border border-gray-300 bg-white hover:bg-gray-50 text-gray-700 focus:ring-gray-400; }
+  .btn-sm { @apply px-3 py-1.5 text-xs; }
+  .btn-lg { @apply px-6 py-3 text-base; }
+
+  /* Cards */
+  .card { @apply bg-white rounded-xl border border-gray-100 shadow-sm p-6; }
+  .card-sm { @apply bg-white rounded-xl border border-gray-100 shadow-sm p-4; }
+
+  /* Form inputs */
+  .form-input { @apply w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors; }
+  .form-select { @apply w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white; }
+  .form-textarea { @apply w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 resize-vertical; }
+  .form-label { @apply block text-sm font-medium text-gray-700 mb-1.5; }
+  .form-error { @apply text-red-500 text-xs mt-1; }
+  .form-hint { @apply text-gray-400 text-xs mt-1; }
+
+  /* Badges */
+  .badge { @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium; }
+  .badge-blue { @apply badge bg-blue-100 text-blue-800; }
+  .badge-green { @apply badge bg-green-100 text-green-800; }
+  .badge-yellow { @apply badge bg-yellow-100 text-yellow-800; }
+  .badge-red { @apply badge bg-red-100 text-red-800; }
+  .badge-gray { @apply badge bg-gray-100 text-gray-700; }
+  .badge-orange { @apply badge bg-orange-100 text-orange-800; }
+  .badge-purple { @apply badge bg-purple-100 text-purple-800; }
+
+  /* Status badges */
+  .status-draft { @apply badge-gray; }
+  .status-submitted { @apply badge-blue; }
+  .status-review { @apply badge-yellow; }
+  .status-approved { @apply badge-green; }
+  .status-active { @apply badge bg-emerald-100 text-emerald-800; }
+  .status-suspended { @apply badge-orange; }
+  .status-rejected { @apply badge-red; }
+  .status-closed { @apply badge-gray; }
+
+  /* Table */
+  .table-container { @apply overflow-x-auto rounded-xl border border-gray-100; }
+  .table { @apply min-w-full divide-y divide-gray-100; }
+  .table thead { @apply bg-gray-50; }
+  .table th { @apply px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider; }
+  .table td { @apply px-4 py-3 text-sm text-gray-700; }
+  .table tbody tr { @apply hover:bg-gray-50 transition-colors; }
+  .table tbody { @apply divide-y divide-gray-50 bg-white; }
+
+  /* Risk level colors */
+  .risk-low { @apply badge bg-green-100 text-green-800; }
+  .risk-medium { @apply badge bg-yellow-100 text-yellow-800; }
+  .risk-high { @apply badge bg-orange-100 text-orange-800; }
+  .risk-critical { @apply badge bg-red-100 text-red-800; }
+
+  /* Page section */
+  .page-header { @apply flex items-center justify-between mb-6; }
+  .page-title { @apply text-xl font-bold text-gray-900; }
+  .section-title { @apply text-base font-semibold text-gray-800 mb-4; }
+
+  /* Stat card */
+  .stat-card { @apply card flex items-center gap-4; }
+  .stat-icon { @apply w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0; }
+  .stat-value { @apply text-2xl font-bold; }
+  .stat-label { @apply text-sm text-gray-500; }
+
+  /* Alert boxes */
+  .alert { @apply flex items-start gap-3 p-4 rounded-lg text-sm; }
+  .alert-info { @apply alert bg-blue-50 text-blue-800 border border-blue-200; }
+  .alert-success { @apply alert bg-green-50 text-green-800 border border-green-200; }
+  .alert-warning { @apply alert bg-yellow-50 text-yellow-800 border border-yellow-200; }
+  .alert-danger { @apply alert bg-red-50 text-red-800 border border-red-200; }
+}
+```
+
+### Build CSS:
+```bash
+cd src/PTW.JSEA.Web
+npm run build:css
+```
+
+---
+
+## BAGIAN I — DOWNLOAD SIGNALR CLIENT
+
+Download SignalR JavaScript client:
+```bash
+cd src/PTW.JSEA.Web
+mkdir -p wwwroot/lib/signalr
+# Download via npm
+npm install @microsoft/signalr
+copy node_modules\@microsoft\signalr\dist\browser\signalr.min.js wwwroot\lib\signalr\
+```
+
+---
+
+## BAGIAN J — BUAT SITE.JS
+
+### FILE: `src/PTW.JSEA.Web/wwwroot/js/site.js`
+```javascript
+// ─── SignalR Connection ────────────────────────────────────────────────────
+let connection;
+
+function initSignalR() {
+    connection = new signalR.HubConnectionBuilder()
+        .withUrl("/hubs/permit")
+        .withAutomaticReconnect([0, 2000, 5000, 10000, 30000])
+        .configureLogging(signalR.LogLevel.Warning)
+        .build();
+
+    // Event handlers
+    connection.on("PermitStatusChanged", (data) => {
+        const badge = document.getElementById(`permit-status-${data.permitId}`);
+        if (badge) badge.textContent = data.newStatus;
+        showToast(`Permit #${data.permitId}: Status berubah ke ${data.newStatus}`, 'info');
+    });
+
+    connection.on("CounterUpdated", (data) => {
+        const el = document.getElementById("active-permits-count");
+        const wl = document.getElementById("active-workers-count");
+        if (el) el.textContent = data.activePermits;
+        if (wl) wl.textContent = data.activeWorkers;
+    });
+
+    connection.on("EmergencyStop", (data) => {
+        showToast(`🚨 EMERGENCY STOP — ${data.location}: ${data.reason}`, 'emergency', 10000);
+        // Tampilkan modal jika ada
+        const modal = document.getElementById('emergencyModal');
+        if (modal) {
+            document.getElementById('emergencyLocation').textContent = data.location;
+            document.getElementById('emergencyReason').textContent = data.reason;
+            modal.classList.remove('hidden');
+        }
+    });
+
+    connection.on("AdherenceOverdue", (data) => {
+        showToast(`⚠️ Adherence overdue: Permit ${data.permitNumber}`, 'warning');
+    });
+
+    connection.on("NewNotification", (data) => {
+        loadNotifCount();
+        showToast(data.title, 'info');
+    });
+
+    connection.onreconnecting(() => console.log('SignalR reconnecting...'));
+    connection.onreconnected(() => {
+        console.log('SignalR reconnected');
+        connection.invoke("JoinDashboardGroup").catch(console.error);
+    });
+
+    connection.start()
+        .then(() => {
+            console.log('SignalR connected');
+            connection.invoke("JoinDashboardGroup").catch(console.error);
+        })
+        .catch(err => console.error('SignalR error:', err));
+}
+
+// Init SignalR bila user logged in
+if (document.getElementById('sidebar')) {
+    initSignalR();
+}
+
+// ─── Utility: Confirm dialog ──────────────────────────────────────────────
+function confirmAction(message, callback) {
+    if (confirm(message)) callback();
+}
+
+// ─── Utility: Format tanggal lokal ────────────────────────────────────────
+function formatDate(dateStr) {
+    return new Date(dateStr).toLocaleDateString('id-ID', {
+        day: '2-digit', month: 'short', year: 'numeric'
+    });
+}
+
+function formatDateTime(dateStr) {
+    return new Date(dateStr).toLocaleString('id-ID', {
+        day: '2-digit', month: 'short', year: 'numeric',
+        hour: '2-digit', minute: '2-digit'
+    });
+}
+
+// ─── Utility: Countdown timer ─────────────────────────────────────────────
+function startCountdown(endTimeStr, elementId) {
+    const el = document.getElementById(elementId);
+    if (!el) return;
+
+    function update() {
+        const diff = new Date(endTimeStr) - new Date();
+        if (diff <= 0) {
+            el.textContent = 'EXPIRED';
+            el.classList.add('text-red-600', 'font-bold');
+            return;
+        }
+        const h = Math.floor(diff / 3600000);
+        const m = Math.floor((diff % 3600000) / 60000);
+        const s = Math.floor((diff % 60000) / 1000);
+        el.textContent = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+        if (diff < 7200000) el.classList.add('text-red-600', 'font-bold');
+    }
+
+    update();
+    setInterval(update, 1000);
+}
+```
+
+---
+
+## BAGIAN K — JALANKAN MIGRATION & TEST
+
+### 1. Build project:
+```bash
+cd C:\Projects\PTW-JSEA
+dotnet build
+```
+
+### 2. Jalankan migration:
+```bash
+dotnet ef migrations add InitialCreate \
+  --project src/PTW.JSEA.Infrastructure \
+  --startup-project src/PTW.JSEA.Web
+
+dotnet ef database update \
+  --project src/PTW.JSEA.Infrastructure \
+  --startup-project src/PTW.JSEA.Web
+```
+
+### 3. Run aplikasi:
+```bash
+cd src/PTW.JSEA.Web
+npm run build:css
+cd C:\Projects\PTW-JSEA
+dotnet run --project src/PTW.JSEA.Web
+```
+
+### 4. Buka browser:
+```
+https://localhost:5001
+```
+
+### 5. Login dengan akun default:
+```
+Email    : admin@ptw-mattel.com
+Password : Mattel@123456
+```
+
+---
+
+## AKUN DEFAULT YANG DIBUAT SEEDER
+
+| Email | Password | Role |
+|---|---|---|
+| admin@ptw-mattel.com | Mattel@123456 | SystemAdmin |
+| safety@ptw-mattel.com | Mattel@123456 | SafetyManager |
+| hse@ptw-mattel.com | Mattel@123456 | HSEOfficer |
+| areaowner@ptw-mattel.com | Mattel@123456 | AreaOwner |
+| approver@ptw-mattel.com | Mattel@123456 | Approver |
+| requester@ptw-mattel.com | Mattel@123456 | Requester |
+| auditor@ptw-mattel.com | Mattel@123456 | Auditor |
+
+---
+
+## CHECKLIST AKHIR MODUL 1-2-3
+
+- [ ] `dotnet build` → **Build succeeded**
+- [ ] Database `PTW_JSEA_DB` terbuat di SQL Server Express
+- [ ] Semua tabel ada di SSMS
+- [ ] Seed data berhasil (7 user, 7 role, sample certificates)
+- [ ] Login page tampil dengan benar
+- [ ] Login berhasil dengan akun admin
+- [ ] Redirect ke `/Dashboard` setelah login
+- [ ] Sidebar navigation tampil
+- [ ] Logout berfungsi
+
+---
+
+> ✅ Modul 1, 2, 3 selesai.
+> Beritahu saya jika ada error pada langkah tertentu, atau ketik **"lanjut modul 4"** untuk mengerjakan TailwindCSS + Dashboard lengkap.
