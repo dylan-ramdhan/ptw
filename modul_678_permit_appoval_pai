@@ -1,0 +1,2069 @@
+# MODUL 6 — PERMIT TO WORK MODULE
+# MODUL 7 — APPROVAL ENGINE & AUTHORIZATION CHECK
+# MODUL 8 — PAI CHECKLIST & PHOTO UPLOAD
+
+---
+
+# ══════════════════════════════════════════════════════
+# MODUL 6 — PERMIT TO WORK
+# ══════════════════════════════════════════════════════
+
+## BAGIAN A — Work Permit Service
+
+### FILE: `src/PTW.JSEA.Application/Services/IWorkPermitService.cs`
+
+```csharp
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Enums;
+
+namespace PTW.JSEA.Application.Services;
+
+public interface IWorkPermitService
+{
+    Task<WorkPermit> CreateAsync(WorkPermit permit, List<PermitWorker> workers, string requesterId);
+    Task<bool> SubmitAsync(int permitId, string userId);
+    Task<bool> ApproveStepAsync(int permitId, string approverId, string comments);
+    Task<bool> RejectAsync(int permitId, string approverId, string reason);
+    Task<bool> SuspendAsync(int permitId, string userId, string reason);
+    Task<bool> ResumeAsync(int permitId, string userId);
+    Task<bool> CloseAsync(int permitId, string userId, string reason);
+    Task<bool> EmergencyStopAsync(int permitId, string userId, string reason);
+    Task<string> GeneratePermitNumberAsync(WorkType workType);
+    Task<bool> CheckApproverEligibilityAsync(string approverId, int permitId);
+    Task InitializeApprovalStepsAsync(WorkPermit permit);
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Application/Services/WorkPermitService.cs`
+
+```csharp
+using Microsoft.AspNetCore.Identity;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Enums;
+using PTW.JSEA.Domain.Interfaces.Repositories;
+using PTW.JSEA.Infrastructure.Data;
+using Microsoft.EntityFrameworkCore;
+
+namespace PTW.JSEA.Application.Services;
+
+public class WorkPermitService : IWorkPermitService
+{
+    private readonly IWorkPermitRepository _permitRepo;
+    private readonly IUserRepository _userRepo;
+    private readonly IAuditService _auditService;
+    private readonly INotificationService _notificationService;
+    private readonly ApplicationDbContext _context;
+    private readonly UserManager<ApplicationUser> _userManager;
+    private readonly IDashboardNotifier _dashboardNotifier;
+
+    public WorkPermitService(
+        IWorkPermitRepository permitRepo,
+        IUserRepository userRepo,
+        IAuditService auditService,
+        INotificationService notificationService,
+        ApplicationDbContext context,
+        UserManager<ApplicationUser> userManager,
+        IDashboardNotifier dashboardNotifier)
+    {
+        _permitRepo          = permitRepo;
+        _userRepo            = userRepo;
+        _auditService        = auditService;
+        _notificationService = notificationService;
+        _context             = context;
+        _userManager         = userManager;
+        _dashboardNotifier   = dashboardNotifier;
+    }
+
+    public async Task<WorkPermit> CreateAsync(WorkPermit permit, List<PermitWorker> workers, string requesterId)
+    {
+        permit.RequesterId  = requesterId;
+        permit.Status       = PermitStatus.Draft;
+        permit.PermitNumber = await GeneratePermitNumberAsync(permit.WorkType);
+        permit.CreatedAt    = DateTime.UtcNow;
+        permit.CreatedBy    = requesterId;
+        permit.Workers      = workers;
+
+        var created = await _permitRepo.AddAsync(permit);
+        await _auditService.LogAsync("WorkPermit", created.Id, "Created", requesterId);
+        return created;
+    }
+
+    public async Task<bool> SubmitAsync(int permitId, string userId)
+    {
+        var permit = await _permitRepo.GetByIdAsync(permitId);
+        if (permit == null || permit.RequesterId != userId) return false;
+        if (permit.Status != PermitStatus.Draft) return false;
+
+        var old = permit.Status.ToString();
+        permit.Status    = PermitStatus.Submitted;
+        permit.UpdatedAt = DateTime.UtcNow;
+        permit.UpdatedBy = userId;
+
+        // Inisialisasi approval steps berdasarkan ApprovalMatrix
+        await InitializeApprovalStepsAsync(permit);
+
+        await _permitRepo.UpdateAsync(permit);
+        await _auditService.LogAsync("WorkPermit", permitId, "Submitted", userId, old, "Submitted");
+
+        // Notifikasi HSE Officer
+        await _notificationService.SendPermitForApprovalNotificationAsync(permit);
+
+        // Advance ke WaitingHSEReview
+        permit.Status = PermitStatus.WaitingHSEReview;
+        await _permitRepo.UpdateAsync(permit);
+
+        return true;
+    }
+
+    public async Task<bool> ApproveStepAsync(int permitId, string approverId, string comments)
+    {
+        var permit = await _context.WorkPermits
+            .Include(p => p.Approvals.OrderBy(a => a.Sequence))
+            .Include(p => p.Requester)
+            .FirstOrDefaultAsync(p => p.Id == permitId);
+
+        if (permit == null) return false;
+
+        // Cek eligibility
+        var eligible = await CheckApproverEligibilityAsync(approverId, permitId);
+        if (!eligible) throw new InvalidOperationException("Approver tidak memiliki sertifikasi valid untuk jenis pekerjaan ini.");
+
+        // Cek role approver cocok dengan step saat ini
+        var nextStep = permit.Approvals.FirstOrDefault(a => a.Status == ApprovalStatus.Pending);
+        if (nextStep == null) return false;
+
+        var approver = await _userManager.FindByIdAsync(approverId);
+        if (approver == null) return false;
+        var approverRoles = await _userManager.GetRolesAsync(approver);
+
+        if (!approverRoles.Contains(nextStep.RequiredRole) &&
+            !approverRoles.Contains("SystemAdmin")) return false;
+
+        // Set approval
+        nextStep.ApproverId  = approverId;
+        nextStep.Status      = ApprovalStatus.Approved;
+        nextStep.ApprovedAt  = DateTime.UtcNow;
+        nextStep.Comments    = comments;
+        nextStep.DigitalSignatureHash = GenerateSignatureHash(approverId, permitId, DateTime.UtcNow);
+
+        // Cek apakah masih ada step berikutnya
+        var nextPending = permit.Approvals
+            .Where(a => a.Status == ApprovalStatus.Pending && a.Sequence > nextStep.Sequence)
+            .OrderBy(a => a.Sequence)
+            .FirstOrDefault();
+
+        var oldStatus = permit.Status.ToString();
+
+        if (nextPending != null)
+        {
+            // Advance ke step berikutnya
+            permit.Status = nextPending.RequiredRole switch
+            {
+                "HSEOfficer"  => PermitStatus.WaitingHSEReview,
+                "AreaOwner"   => PermitStatus.WaitingAreaApproval,
+                "Approver"    => PermitStatus.WaitingFinalApproval,
+                _             => PermitStatus.WaitingFinalApproval
+            };
+        }
+        else
+        {
+            // Semua step selesai → Active
+            permit.Status = PermitStatus.Active;
+        }
+
+        permit.UpdatedAt = DateTime.UtcNow;
+        permit.UpdatedBy = approverId;
+
+        await _context.SaveChangesAsync();
+        await _auditService.LogAsync("WorkPermit", permitId, $"ApprovedStep:{nextStep.Sequence}", approverId, oldStatus, permit.Status.ToString(), comments);
+
+        if (permit.Status == PermitStatus.Active)
+        {
+            await _notificationService.SendPermitApprovedNotificationAsync(permit);
+            await _dashboardNotifier.NotifyPermitStatusChanged(permitId, "Active");
+        }
+        else
+        {
+            // Notifikasi ke approver role berikutnya
+            if (nextPending != null)
+                await _notificationService.CreateInAppForRoleAsync(
+                    nextPending.RequiredRole,
+                    "Permit Menunggu Approval Anda",
+                    $"Permit {permit.PermitNumber} menunggu approval {nextPending.RequiredRole}.",
+                    NotificationType.NewPermitForApproval,
+                    $"/Permits/Detail/{permitId}");
+        }
+
+        return true;
+    }
+
+    public async Task<bool> RejectAsync(int permitId, string approverId, string reason)
+    {
+        var permit = await _permitRepo.GetWithDetailsAsync(permitId);
+        if (permit == null) return false;
+
+        var old = permit.Status.ToString();
+
+        // Reject pending step
+        var pendingStep = permit.Approvals.FirstOrDefault(a => a.Status == ApprovalStatus.Pending);
+        if (pendingStep != null)
+        {
+            pendingStep.Status          = ApprovalStatus.Rejected;
+            pendingStep.ApproverId      = approverId;
+            pendingStep.ApprovedAt      = DateTime.UtcNow;
+            pendingStep.RejectionReason = reason;
+        }
+
+        permit.Status    = PermitStatus.Rejected;
+        permit.UpdatedAt = DateTime.UtcNow;
+        permit.UpdatedBy = approverId;
+
+        await _context.SaveChangesAsync();
+        await _auditService.LogAsync("WorkPermit", permitId, "Rejected", approverId, old, "Rejected", reason);
+        await _notificationService.SendPermitRejectedNotificationAsync(permit, reason);
+        await _dashboardNotifier.NotifyPermitStatusChanged(permitId, "Rejected");
+
+        return true;
+    }
+
+    public async Task<bool> SuspendAsync(int permitId, string userId, string reason)
+    {
+        var permit = await _permitRepo.GetByIdAsync(permitId);
+        if (permit == null || permit.Status != PermitStatus.Active) return false;
+
+        var old = permit.Status.ToString();
+        permit.Status       = PermitStatus.Suspended;
+        permit.SuspendReason= reason;
+        permit.SuspendedAt  = DateTime.UtcNow;
+        permit.SuspendedById= userId;
+        permit.UpdatedAt    = DateTime.UtcNow;
+        permit.UpdatedBy    = userId;
+
+        await _permitRepo.UpdateAsync(permit);
+        await _auditService.LogAsync("WorkPermit", permitId, "Suspended", userId, old, "Suspended", reason);
+        await _dashboardNotifier.NotifyPermitStatusChanged(permitId, "Suspended");
+
+        return true;
+    }
+
+    public async Task<bool> ResumeAsync(int permitId, string userId)
+    {
+        var permit = await _permitRepo.GetByIdAsync(permitId);
+        if (permit == null || permit.Status != PermitStatus.Suspended) return false;
+
+        var old = permit.Status.ToString();
+        permit.Status     = PermitStatus.Active;
+        permit.ResumedAt  = DateTime.UtcNow;
+        permit.UpdatedAt  = DateTime.UtcNow;
+        permit.UpdatedBy  = userId;
+
+        await _permitRepo.UpdateAsync(permit);
+        await _auditService.LogAsync("WorkPermit", permitId, "Resumed", userId, old, "Active");
+        await _dashboardNotifier.NotifyPermitStatusChanged(permitId, "Active");
+
+        return true;
+    }
+
+    public async Task<bool> CloseAsync(int permitId, string userId, string reason)
+    {
+        var permit = await _permitRepo.GetByIdAsync(permitId);
+        if (permit == null) return false;
+        if (permit.Status != PermitStatus.Active && permit.Status != PermitStatus.Suspended) return false;
+
+        var old = permit.Status.ToString();
+        permit.Status      = PermitStatus.Closed;
+        permit.CloseReason = reason;
+        permit.ClosedAt    = DateTime.UtcNow;
+        permit.ClosedById  = userId;
+        permit.UpdatedAt   = DateTime.UtcNow;
+        permit.UpdatedBy   = userId;
+
+        // Check-out semua worker yang masih check-in
+        var workers = await _context.PermitWorkers.Where(w => w.PermitId == permitId && w.CheckInTime.HasValue && !w.CheckOutTime.HasValue).ToListAsync();
+        foreach (var w in workers) w.CheckOutTime = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync();
+        await _auditService.LogAsync("WorkPermit", permitId, "Closed", userId, old, "Closed", reason);
+        await _dashboardNotifier.NotifyPermitStatusChanged(permitId, "Closed");
+
+        return true;
+    }
+
+    public async Task<bool> EmergencyStopAsync(int permitId, string userId, string reason)
+    {
+        var success = await SuspendAsync(permitId, userId, $"[EMERGENCY STOP] {reason}");
+        if (success)
+        {
+            var permit = await _permitRepo.GetByIdAsync(permitId);
+            if (permit != null)
+                await _dashboardNotifier.NotifyEmergencyStop(permitId, permit.Location, reason);
+        }
+        return success;
+    }
+
+    public async Task<string> GeneratePermitNumberAsync(WorkType workType)
+    {
+        var prefix = workType switch
+        {
+            WorkType.HotWork            => "HW",
+            WorkType.ColdWork           => "CW",
+            WorkType.ElectricalIsolation=> "EI",
+            WorkType.ConfinedSpaceEntry => "CS",
+            WorkType.Excavation         => "EX",
+            WorkType.Lifting            => "LF",
+            WorkType.WorkingAtHeight    => "WH",
+            _                           => "WP"
+        };
+        var date = DateTime.Now.ToString("yyyyMMdd");
+        var seq  = await _permitRepo.GetTodaySequenceAsync(workType) + 1;
+        return $"MTL-{prefix}-{date}-{seq:D3}";
+    }
+
+    public async Task<bool> CheckApproverEligibilityAsync(string approverId, int permitId)
+    {
+        var permit = await _permitRepo.GetByIdAsync(permitId);
+        if (permit == null) return false;
+        return await _userRepo.HasValidCertificateAsync(approverId, permit.WorkType);
+    }
+
+    public async Task InitializeApprovalStepsAsync(WorkPermit permit)
+    {
+        var matrices = await _context.ApprovalMatrices
+            .Where(m => m.WorkType == permit.WorkType
+                     && m.RiskLevel == permit.RiskLevel
+                     && m.IsActive)
+            .OrderBy(m => m.Sequence)
+            .ToListAsync();
+
+        var approvals = matrices.Select(m => new PermitApproval
+        {
+            PermitId     = permit.Id,
+            RequiredRole = m.RequiredRole,
+            Sequence     = m.Sequence,
+            Status       = ApprovalStatus.Pending,
+            CreatedAt    = DateTime.UtcNow
+        }).ToList();
+
+        _context.PermitApprovals.AddRange(approvals);
+    }
+
+    private static string GenerateSignatureHash(string userId, int permitId, DateTime timestamp)
+        => Convert.ToBase64String(
+            System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes($"{userId}:{permitId}:{timestamp:O}")));
+}
+```
+
+---
+
+## BAGIAN B — Dashboard Notifier Interface & Impl
+
+### FILE: `src/PTW.JSEA.Application/Services/IDashboardNotifier.cs`
+
+```csharp
+namespace PTW.JSEA.Application.Services;
+
+public interface IDashboardNotifier
+{
+    Task NotifyPermitStatusChanged(int permitId, string newStatus);
+    Task NotifyDashboardCounterUpdated(int activePermits, int activeWorkers);
+    Task NotifyEmergencyStop(int permitId, string location, string reason);
+    Task NotifyAdherenceOverdue(int permitId, string permitNumber);
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Infrastructure/Services/SignalRDashboardNotifier.cs`
+
+```csharp
+using Microsoft.AspNetCore.SignalR;
+using PTW.JSEA.Application.Services;
+
+namespace PTW.JSEA.Infrastructure.Services;
+
+public class SignalRDashboardNotifier : IDashboardNotifier
+{
+    private readonly IHubContext<PTW.JSEA.Web.Hubs.PermitHub> _hubContext;
+
+    public SignalRDashboardNotifier(IHubContext<PTW.JSEA.Web.Hubs.PermitHub> hubContext)
+        => _hubContext = hubContext;
+
+    public async Task NotifyPermitStatusChanged(int permitId, string newStatus)
+    {
+        await _hubContext.Clients.Group("Dashboard")
+            .SendAsync("PermitStatusChanged", new { permitId, newStatus, timestamp = DateTime.UtcNow });
+        await _hubContext.Clients.Group($"Permit_{permitId}")
+            .SendAsync("StatusUpdated", newStatus);
+    }
+
+    public async Task NotifyDashboardCounterUpdated(int activePermits, int activeWorkers)
+        => await _hubContext.Clients.Group("Dashboard")
+            .SendAsync("CounterUpdated", new { activePermits, activeWorkers });
+
+    public async Task NotifyEmergencyStop(int permitId, string location, string reason)
+        => await _hubContext.Clients.All
+            .SendAsync("EmergencyStop", new { permitId, location, reason, timestamp = DateTime.UtcNow });
+
+    public async Task NotifyAdherenceOverdue(int permitId, string permitNumber)
+        => await _hubContext.Clients.Group("Dashboard")
+            .SendAsync("AdherenceOverdue", new { permitId, permitNumber });
+}
+```
+
+### Daftarkan di `DependencyInjection.cs` Infrastructure:
+
+```csharp
+// Tambahkan ke AddInfrastructureServices
+services.AddScoped<IDashboardNotifier, SignalRDashboardNotifier>();
+```
+
+---
+
+## BAGIAN C — Permit List Page
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Index.cshtml.cs`
+
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+using Microsoft.EntityFrameworkCore;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Enums;
+using PTW.JSEA.Infrastructure.Data;
+
+namespace PTW.JSEA.Web.Pages.Permits;
+
+[Authorize]
+public class IndexModel : PageModel
+{
+    private readonly ApplicationDbContext _context;
+    private readonly UserManager<ApplicationUser> _userManager;
+
+    public IndexModel(ApplicationDbContext context, UserManager<ApplicationUser> userManager)
+    {
+        _context     = context;
+        _userManager = userManager;
+    }
+
+    public List<WorkPermit> Permits { get; set; } = new();
+
+    [BindProperty(SupportsGet = true)] public string? StatusFilter { get; set; }
+    [BindProperty(SupportsGet = true)] public string? WorkTypeFilter { get; set; }
+    [BindProperty(SupportsGet = true)] public string? Search { get; set; }
+
+    public async Task OnGetAsync()
+    {
+        var user  = await _userManager.GetUserAsync(User);
+        var roles = await _userManager.GetRolesAsync(user!);
+
+        var query = _context.WorkPermits
+            .Include(p => p.Requester)
+            .Include(p => p.JSEA)
+            .Include(p => p.Workers)
+            .AsQueryable();
+
+        // Requester hanya lihat milik sendiri
+        if (!roles.Any(r => r is "SystemAdmin" or "HSEOfficer" or "SafetyManager" or "Auditor" or "AreaOwner" or "Approver"))
+            query = query.Where(p => p.RequesterId == user!.Id);
+
+        if (!string.IsNullOrEmpty(StatusFilter) && Enum.TryParse<PermitStatus>(StatusFilter, out var status))
+            query = query.Where(p => p.Status == status);
+
+        if (!string.IsNullOrEmpty(WorkTypeFilter) && Enum.TryParse<WorkType>(WorkTypeFilter, out var wt))
+            query = query.Where(p => p.WorkType == wt);
+
+        if (!string.IsNullOrEmpty(Search))
+            query = query.Where(p => p.PermitNumber.Contains(Search) || p.Location.Contains(Search));
+
+        Permits = await query.OrderByDescending(p => p.CreatedAt).Take(100).ToListAsync();
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Index.cshtml`
+
+```html
+@page
+@model PTW.JSEA.Web.Pages.Permits.IndexModel
+@{
+    ViewData["Title"] = "Daftar Permit";
+}
+
+<div class="page-header">
+    <div>
+        <h2 class="page-title">Daftar Permit To Work</h2>
+        <p class="text-sm text-gray-500">Semua izin kerja dalam sistem</p>
+    </div>
+    <a asp-page="/Permits/Create" class="btn-primary">+ Buat Permit</a>
+</div>
+
+<!-- Filter -->
+<div class="card mb-4">
+    <form method="get" class="flex flex-wrap items-end gap-3">
+        <div class="flex-1 min-w-40">
+            <label class="form-label">Cari</label>
+            <input asp-for="Search" class="form-input" placeholder="No. Permit / Lokasi..."/>
+        </div>
+        <div class="w-44">
+            <label class="form-label">Status</label>
+            <select asp-for="StatusFilter" class="form-select">
+                <option value="">Semua Status</option>
+                <option value="Draft">Draft</option>
+                <option value="Submitted">Submitted</option>
+                <option value="WaitingHSEReview">Waiting HSE</option>
+                <option value="WaitingPAI">Waiting PAI</option>
+                <option value="WaitingAreaApproval">Waiting Area</option>
+                <option value="WaitingFinalApproval">Waiting Final</option>
+                <option value="Active">Active</option>
+                <option value="Suspended">Suspended</option>
+                <option value="Closed">Closed</option>
+                <option value="Rejected">Rejected</option>
+            </select>
+        </div>
+        <div class="w-44">
+            <label class="form-label">Jenis</label>
+            <select asp-for="WorkTypeFilter" class="form-select">
+                <option value="">Semua Jenis</option>
+                <option value="HotWork">Hot Work</option>
+                <option value="ColdWork">Cold Work</option>
+                <option value="ElectricalIsolation">Electrical</option>
+                <option value="ConfinedSpaceEntry">Confined Space</option>
+                <option value="Excavation">Excavation</option>
+                <option value="Lifting">Lifting</option>
+                <option value="WorkingAtHeight">At Height</option>
+            </select>
+        </div>
+        <button type="submit" class="btn-primary">Filter</button>
+        <a asp-page="/Permits/Index" class="btn-outline">Reset</a>
+    </form>
+</div>
+
+<!-- Table -->
+<div class="card">
+    @if (!Model.Permits.Any())
+    {
+        <div class="flex flex-col items-center py-16 text-gray-300">
+            <svg class="w-16 h-16 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1" d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2"/>
+            </svg>
+            <p class="text-gray-400 font-medium">Belum ada permit</p>
+        </div>
+    }
+    else
+    {
+        <div class="table-container">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>No. Permit</th>
+                        <th>Jenis</th>
+                        <th>Lokasi</th>
+                        <th>Pemohon</th>
+                        <th>Pekerja</th>
+                        <th>Risk</th>
+                        <th>Mulai</th>
+                        <th>Selesai</th>
+                        <th>Status</th>
+                        <th>Aksi</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var p in Model.Permits)
+                    {
+                        <tr>
+                            <td>
+                                <span class="font-mono text-blue-700 font-semibold text-xs">@p.PermitNumber</span>
+                            </td>
+                            <td><span class="badge-blue text-xs">@p.WorkType.ToString().Replace("WorkingAtHeight","At Height").Replace("ConfinedSpaceEntry","Confined Space").Replace("ElectricalIsolation","Electrical")</span></td>
+                            <td class="text-gray-700">@p.Location</td>
+                            <td class="text-gray-600 text-xs">@(p.Requester?.FullName ?? "-")</td>
+                            <td class="text-center"><span class="badge-gray text-xs">@p.Workers.Count org</span></td>
+                            <td>
+                                @{var rc = p.RiskLevel switch { RiskLevel.Low => "risk-low", RiskLevel.Medium => "risk-medium", RiskLevel.High => "risk-high", _ => "risk-critical" };}
+                                <span class="@rc">@p.RiskLevel</span>
+                            </td>
+                            <td class="text-xs text-gray-600">@p.StartTime.ToLocalTime().ToString("dd MMM HH:mm")</td>
+                            <td class="text-xs @(p.IsExpiringSoon ? "text-red-600 font-bold" : "text-gray-600")">@p.EndTime.ToLocalTime().ToString("dd MMM HH:mm")</td>
+                            <td>
+                                @{var sc = p.Status switch {
+                                    PermitStatus.Draft                => "status-draft",
+                                    PermitStatus.Submitted            => "status-submitted",
+                                    PermitStatus.WaitingHSEReview     => "badge-yellow",
+                                    PermitStatus.WaitingPAI           => "badge-orange",
+                                    PermitStatus.WaitingAreaApproval  => "badge-yellow",
+                                    PermitStatus.WaitingFinalApproval => "badge-yellow",
+                                    PermitStatus.Active               => "status-active",
+                                    PermitStatus.Suspended            => "status-suspended",
+                                    PermitStatus.Closed               => "status-draft",
+                                    PermitStatus.Rejected             => "status-rejected",
+                                    _                                 => "badge-gray"
+                                };}
+                                <span id="permit-status-@p.Id" class="@sc text-xs">@p.Status</span>
+                            </td>
+                            <td>
+                                <a asp-page="/Permits/Detail" asp-route-id="@p.Id"
+                                   class="text-blue-600 hover:underline text-xs font-medium">Detail</a>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+        <p class="text-xs text-gray-400 mt-3">Menampilkan @Model.Permits.Count permit</p>
+    }
+</div>
+```
+
+---
+
+## BAGIAN D — Permit Create Page
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Create.cshtml.cs`
+
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+using Microsoft.AspNetCore.Mvc.Rendering;
+using Microsoft.EntityFrameworkCore;
+using PTW.JSEA.Application.Services;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Enums;
+using PTW.JSEA.Infrastructure.Data;
+using System.Text.Json;
+
+namespace PTW.JSEA.Web.Pages.Permits;
+
+[Authorize(Roles = "Requester,SystemAdmin,HSEOfficer,SafetyManager")]
+public class CreateModel : PageModel
+{
+    private readonly IWorkPermitService _permitService;
+    private readonly ApplicationDbContext _context;
+    private readonly UserManager<ApplicationUser> _userManager;
+
+    public CreateModel(
+        IWorkPermitService permitService,
+        ApplicationDbContext context,
+        UserManager<ApplicationUser> userManager)
+    {
+        _permitService = permitService;
+        _context       = context;
+        _userManager   = userManager;
+    }
+
+    [BindProperty] public PermitInputModel Input { get; set; } = new();
+    [BindProperty] public string WorkersJson { get; set; } = "[]";
+
+    public List<SelectListItem> JSEAOptions { get; set; } = new();
+
+    public class PermitInputModel
+    {
+        public int JSEAId { get; set; }
+        public string Location { get; set; } = string.Empty;
+        public string? SpecificArea { get; set; }
+        public WorkType WorkType { get; set; }
+        public RiskLevel RiskLevel { get; set; }
+        public DateTime StartTime { get; set; } = DateTime.Now.AddHours(1);
+        public DateTime EndTime { get; set; } = DateTime.Now.AddHours(9);
+        public string? Description { get; set; }
+    }
+
+    public async Task OnGetAsync()
+    {
+        var user = await _userManager.GetUserAsync(User);
+        await LoadJSEAOptionsAsync(user!.Id);
+    }
+
+    public async Task<IActionResult> OnPostAsync()
+    {
+        var user = await _userManager.GetUserAsync(User);
+        await LoadJSEAOptionsAsync(user!.Id);
+
+        if (!ModelState.IsValid) return Page();
+
+        // Parse workers
+        List<PermitWorker> workers = new();
+        try
+        {
+            var raw = JsonSerializer.Deserialize<List<WorkerInput>>(WorkersJson,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            workers = raw?.Select(w => new PermitWorker
+            {
+                WorkerName    = w.WorkerName,
+                Company       = w.Company,
+                Position      = w.Position,
+                FitnessStatus = true
+            }).ToList() ?? new();
+        }
+        catch { }
+
+        var permit = new WorkPermit
+        {
+            JSEAId      = Input.JSEAId,
+            Location    = Input.Location,
+            SpecificArea= Input.SpecificArea,
+            WorkType    = Input.WorkType,
+            RiskLevel   = Input.RiskLevel,
+            StartTime   = Input.StartTime.ToUniversalTime(),
+            EndTime     = Input.EndTime.ToUniversalTime(),
+            Description = Input.Description
+        };
+
+        var created = await _permitService.CreateAsync(permit, workers, user!.Id);
+        TempData["Success"] = $"Permit {created.PermitNumber} berhasil dibuat.";
+        return RedirectToPage("/Permits/Detail", new { id = created.Id });
+    }
+
+    private async Task LoadJSEAOptionsAsync(string userId)
+    {
+        var jseas = await _context.JSEAs
+            .Where(j => j.Status == JSEAStatus.Approved && !j.IsDeleted)
+            .Select(j => new { j.Id, j.WorkTitle, j.WorkType, j.Location })
+            .ToListAsync();
+
+        JSEAOptions = jseas.Select(j => new SelectListItem
+        {
+            Value = j.Id.ToString(),
+            Text  = $"{j.WorkTitle} ({j.WorkType}) — {j.Location}"
+        }).ToList();
+    }
+
+    public class WorkerInput
+    {
+        public string WorkerName { get; set; } = string.Empty;
+        public string? Company { get; set; }
+        public string? Position { get; set; }
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Create.cshtml`
+
+```html
+@page
+@model PTW.JSEA.Web.Pages.Permits.CreateModel
+@{
+    ViewData["Title"] = "Buat Permit To Work";
+}
+
+<div class="page-header">
+    <div>
+        <h2 class="page-title">Buat Permit To Work</h2>
+        <p class="text-sm text-gray-500">Isi data permit sesuai dengan JSEA yang telah disetujui</p>
+    </div>
+    <a asp-page="/Permits/Index" class="btn-outline">← Kembali</a>
+</div>
+
+<form method="post" id="permitForm">
+    @Html.AntiForgeryToken()
+    <input type="hidden" asp-for="WorkersJson" id="workersJsonInput"/>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        <!-- MAIN FORM (2/3) -->
+        <div class="lg:col-span-2 space-y-6">
+
+            <!-- Informasi Dasar -->
+            <div class="card">
+                <h3 class="section-title">Informasi Permit</h3>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="md:col-span-2">
+                        <label class="form-label">JSEA yang Digunakan <span class="text-red-500">*</span></label>
+                        <select asp-for="Input.JSEAId" asp-items="Model.JSEAOptions"
+                                class="form-select" onchange="loadJSEAData(this.value)">
+                            <option value="">-- Pilih JSEA yang telah disetujui --</option>
+                        </select>
+                        <p class="form-hint">Hanya JSEA berstatus Approved yang dapat digunakan</p>
+                    </div>
+                    <div>
+                        <label class="form-label">Jenis Pekerjaan <span class="text-red-500">*</span></label>
+                        <select asp-for="Input.WorkType" class="form-select">
+                            <option value="">-- Pilih --</option>
+                            <option value="HotWork">Hot Work</option>
+                            <option value="ColdWork">Cold Work</option>
+                            <option value="ElectricalIsolation">Electrical Isolation</option>
+                            <option value="ConfinedSpaceEntry">Confined Space Entry</option>
+                            <option value="Excavation">Excavation</option>
+                            <option value="Lifting">Lifting</option>
+                            <option value="WorkingAtHeight">Working at Height</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="form-label">Risk Level <span class="text-red-500">*</span></label>
+                        <select asp-for="Input.RiskLevel" class="form-select">
+                            <option value="Low">Low</option>
+                            <option value="Medium">Medium</option>
+                            <option value="High">High</option>
+                            <option value="Critical">Critical</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="form-label">Lokasi <span class="text-red-500">*</span></label>
+                        <input asp-for="Input.Location" class="form-input" placeholder="Area produksi B2"/>
+                    </div>
+                    <div>
+                        <label class="form-label">Area Spesifik</label>
+                        <input asp-for="Input.SpecificArea" class="form-input" placeholder="Lantai 2, mesin no.5"/>
+                    </div>
+                    <div>
+                        <label class="form-label">Waktu Mulai <span class="text-red-500">*</span></label>
+                        <input asp-for="Input.StartTime" type="datetime-local" class="form-input"/>
+                    </div>
+                    <div>
+                        <label class="form-label">Waktu Selesai <span class="text-red-500">*</span></label>
+                        <input asp-for="Input.EndTime" type="datetime-local" class="form-input"/>
+                    </div>
+                    <div class="md:col-span-2">
+                        <label class="form-label">Deskripsi Pekerjaan</label>
+                        <textarea asp-for="Input.Description" class="form-textarea" rows="3"
+                                  placeholder="Deskripsi singkat pekerjaan yang akan dilakukan..."></textarea>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Daftar Pekerja -->
+            <div class="card">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="section-title mb-0">Daftar Pekerja</h3>
+                    <button type="button" onclick="addWorkerRow()" class="btn-primary btn-sm">+ Tambah</button>
+                </div>
+                <div id="workerList" class="space-y-3">
+                    <!-- Baris ditambah via JS -->
+                </div>
+                <p id="workerError" class="text-red-500 text-xs mt-2 hidden">Minimal 1 pekerja harus didaftarkan.</p>
+            </div>
+        </div>
+
+        <!-- SIDEBAR INFO (1/3) -->
+        <div class="space-y-4">
+            <div class="card border-blue-200 bg-blue-50">
+                <h4 class="font-semibold text-blue-800 mb-3 text-sm">ℹ️ Informasi Approval</h4>
+                <p class="text-xs text-blue-700 mb-3">
+                    Permit akan melalui tahap approval sesuai jenis pekerjaan dan risk level:
+                </p>
+                <div class="space-y-2 text-xs text-blue-700">
+                    <div class="flex items-center gap-2">
+                        <span class="w-5 h-5 bg-blue-200 rounded-full flex items-center justify-center text-xs font-bold">1</span>
+                        HSE Officer Review
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="w-5 h-5 bg-blue-200 rounded-full flex items-center justify-center text-xs font-bold">2</span>
+                        Area Owner Approval
+                    </div>
+                    <div class="flex items-center gap-2 text-blue-400">
+                        <span class="w-5 h-5 bg-blue-100 rounded-full flex items-center justify-center text-xs font-bold">3</span>
+                        Final Approval (High/Critical)
+                    </div>
+                </div>
+            </div>
+
+            <div class="card border-yellow-200 bg-yellow-50">
+                <h4 class="font-semibold text-yellow-800 mb-2 text-sm">⚠️ Perhatian</h4>
+                <ul class="text-xs text-yellow-700 space-y-1 list-disc list-inside">
+                    <li>JSEA harus sudah disetujui HSE</li>
+                    <li>Waktu selesai tidak boleh > 8 jam dari mulai</li>
+                    <li>PAI wajib dilakukan sebelum pekerjaan dimulai</li>
+                    <li>Adherence check setiap 4 jam</li>
+                </ul>
+            </div>
+
+            <button type="submit" onclick="prepareSubmit()" class="btn-primary w-full btn-lg">
+                Buat Permit →
+            </button>
+            <a asp-page="/Permits/Index" class="btn-outline w-full text-center block">Batal</a>
+        </div>
+    </div>
+</form>
+
+@section Scripts {
+<script>
+let workerCount = 0;
+
+function addWorkerRow() {
+    workerCount++;
+    const id = workerCount;
+    const container = document.getElementById('workerList');
+    const div = document.createElement('div');
+    div.id = `worker-${id}`;
+    div.className = 'flex items-start gap-3 p-3 bg-gray-50 rounded-lg';
+    div.innerHTML = `
+        <div class="flex-1 grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <input type="text" placeholder="Nama lengkap *" id="wname-${id}"
+                   class="form-input text-sm" required/>
+            <input type="text" placeholder="Perusahaan" id="wcompany-${id}"
+                   class="form-input text-sm"/>
+            <input type="text" placeholder="Jabatan" id="wposition-${id}"
+                   class="form-input text-sm"/>
+        </div>
+        <button type="button" onclick="removeWorker(${id})"
+                class="text-red-400 hover:text-red-600 p-1 mt-1">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                      d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+        </button>
+    `;
+    container.appendChild(div);
+}
+
+function removeWorker(id) {
+    document.getElementById(`worker-${id}`)?.remove();
+    workerCount--;
+}
+
+function prepareSubmit() {
+    const workers = [];
+    document.querySelectorAll('[id^="worker-"]').forEach(row => {
+        const id = row.id.split('-')[1];
+        const name = document.getElementById(`wname-${id}`)?.value;
+        if (name) workers.push({
+            WorkerName: name,
+            Company:   document.getElementById(`wcompany-${id}`)?.value || '',
+            Position:  document.getElementById(`wposition-${id}`)?.value || ''
+        });
+    });
+    if (workers.length === 0) {
+        document.getElementById('workerError').classList.remove('hidden');
+        return false;
+    }
+    document.getElementById('workerError').classList.add('hidden');
+    document.getElementById('workersJsonInput').value = JSON.stringify(workers);
+    return true;
+}
+
+// Default: tambah 1 worker
+addWorkerRow();
+</script>
+}
+```
+
+---
+
+# ══════════════════════════════════════════════════════
+# MODUL 7 — APPROVAL ENGINE & PERMIT DETAIL
+# ══════════════════════════════════════════════════════
+
+## BAGIAN A — Permit Detail Page
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Detail.cshtml.cs`
+
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+using PTW.JSEA.Application.Services;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Enums;
+using PTW.JSEA.Domain.Interfaces.Repositories;
+
+namespace PTW.JSEA.Web.Pages.Permits;
+
+[Authorize]
+public class DetailModel : PageModel
+{
+    private readonly IWorkPermitRepository _permitRepo;
+    private readonly IWorkPermitService _permitService;
+    private readonly IUserRepository _userRepo;
+    private readonly UserManager<ApplicationUser> _userManager;
+
+    public DetailModel(
+        IWorkPermitRepository permitRepo,
+        IWorkPermitService permitService,
+        IUserRepository userRepo,
+        UserManager<ApplicationUser> userManager)
+    {
+        _permitRepo    = permitRepo;
+        _permitService = permitService;
+        _userRepo      = userRepo;
+        _userManager   = userManager;
+    }
+
+    public WorkPermit Permit { get; set; } = null!;
+    public bool CanSubmit      { get; set; }
+    public bool CanApprove     { get; set; }
+    public bool CanReject      { get; set; }
+    public bool CanSuspend     { get; set; }
+    public bool CanResume      { get; set; }
+    public bool CanClose       { get; set; }
+    public bool CanEmergencyStop { get; set; }
+    public bool IsApproverEligible { get; set; }
+    public PermitApproval? CurrentApprovalStep { get; set; }
+
+    [BindProperty] public string? ApprovalComments  { get; set; }
+    [BindProperty] public string? RejectionReason   { get; set; }
+    [BindProperty] public string? SuspendReason     { get; set; }
+    [BindProperty] public string? CloseReason       { get; set; }
+
+    public async Task<IActionResult> OnGetAsync(int id)
+    {
+        var permit = await _permitRepo.GetWithDetailsAsync(id);
+        if (permit == null) return NotFound();
+        Permit = permit;
+
+        var user  = await _userManager.GetUserAsync(User);
+        var roles = await _userManager.GetRolesAsync(user!);
+
+        CurrentApprovalStep = permit.Approvals
+            .Where(a => a.Status == ApprovalStatus.Pending)
+            .OrderBy(a => a.Sequence)
+            .FirstOrDefault();
+
+        // Eligibility check
+        if (CurrentApprovalStep != null && roles.Contains(CurrentApprovalStep.RequiredRole))
+            IsApproverEligible = await _permitService.CheckApproverEligibilityAsync(user!.Id, id);
+
+        CanSubmit        = permit.RequesterId == user!.Id && permit.Status == PermitStatus.Draft;
+        CanApprove       = IsApproverEligible && CurrentApprovalStep != null &&
+                          roles.Contains(CurrentApprovalStep?.RequiredRole ?? "");
+        CanReject        = CanApprove;
+        CanSuspend       = permit.Status == PermitStatus.Active &&
+                          roles.Any(r => r is "HSEOfficer" or "SafetyManager" or "SystemAdmin" or "AreaOwner");
+        CanResume        = permit.Status == PermitStatus.Suspended &&
+                          roles.Any(r => r is "HSEOfficer" or "SafetyManager" or "SystemAdmin");
+        CanClose         = (permit.Status == PermitStatus.Active || permit.Status == PermitStatus.Suspended) &&
+                          (permit.RequesterId == user!.Id || roles.Any(r => r is "HSEOfficer" or "SafetyManager" or "SystemAdmin"));
+        CanEmergencyStop = permit.Status == PermitStatus.Active &&
+                          roles.Any(r => r is "HSEOfficer" or "SafetyManager" or "SystemAdmin" or "AreaOwner");
+
+        if (TempData["Success"] != null) ViewData["Success"] = TempData["Success"];
+        if (TempData["Error"] != null)   ViewData["Error"]   = TempData["Error"];
+        return Page();
+    }
+
+    public async Task<IActionResult> OnPostSubmitAsync(int id)
+    {
+        var user = await _userManager.GetUserAsync(User);
+        var ok   = await _permitService.SubmitAsync(id, user!.Id);
+        TempData[ok ? "Success" : "Error"] = ok ? "Permit berhasil disubmit." : "Gagal submit permit.";
+        return RedirectToPage(new { id });
+    }
+
+    public async Task<IActionResult> OnPostApproveAsync(int id)
+    {
+        var user = await _userManager.GetUserAsync(User);
+        try
+        {
+            var ok = await _permitService.ApproveStepAsync(id, user!.Id, ApprovalComments ?? "");
+            TempData[ok ? "Success" : "Error"] = ok ? "Permit berhasil di-approve." : "Gagal approve permit.";
+        }
+        catch (InvalidOperationException ex)
+        {
+            TempData["Error"] = ex.Message;
+        }
+        return RedirectToPage(new { id });
+    }
+
+    public async Task<IActionResult> OnPostRejectAsync(int id)
+    {
+        var user = await _userManager.GetUserAsync(User);
+        var ok   = await _permitService.RejectAsync(id, user!.Id, RejectionReason ?? "-");
+        TempData[ok ? "Success" : "Error"] = ok ? "Permit ditolak." : "Gagal menolak permit.";
+        return RedirectToPage(new { id });
+    }
+
+    public async Task<IActionResult> OnPostSuspendAsync(int id)
+    {
+        var user = await _userManager.GetUserAsync(User);
+        var ok   = await _permitService.SuspendAsync(id, user!.Id, SuspendReason ?? "-");
+        TempData[ok ? "Success" : "Error"] = ok ? "Permit disuspend." : "Gagal suspend permit.";
+        return RedirectToPage(new { id });
+    }
+
+    public async Task<IActionResult> OnPostResumeAsync(int id)
+    {
+        var user = await _userManager.GetUserAsync(User);
+        var ok   = await _permitService.ResumeAsync(id, user!.Id);
+        TempData[ok ? "Success" : "Error"] = ok ? "Permit diaktifkan kembali." : "Gagal resume permit.";
+        return RedirectToPage(new { id });
+    }
+
+    public async Task<IActionResult> OnPostCloseAsync(int id)
+    {
+        var user = await _userManager.GetUserAsync(User);
+        var ok   = await _permitService.CloseAsync(id, user!.Id, CloseReason ?? "Pekerjaan selesai.");
+        TempData[ok ? "Success" : "Error"] = ok ? "Permit ditutup." : "Gagal menutup permit.";
+        return RedirectToPage(new { id });
+    }
+
+    public async Task<IActionResult> OnPostEmergencyStopAsync(int id)
+    {
+        var user = await _userManager.GetUserAsync(User);
+        await _permitService.EmergencyStopAsync(id, user!.Id, SuspendReason ?? "Emergency stop");
+        TempData["Success"] = "Emergency stop berhasil. Semua pihak telah diberitahu.";
+        return RedirectToPage(new { id });
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Detail.cshtml`
+
+```html
+@page "{id:int}"
+@model PTW.JSEA.Web.Pages.Permits.DetailModel
+@{
+    ViewData["Title"] = $"Permit — {Model.Permit.PermitNumber}";
+    var p = Model.Permit;
+}
+
+@if (ViewData["Success"] != null)
+{
+    <div class="alert-success mb-4"><svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg><span>@ViewData["Success"]</span></div>
+}
+@if (ViewData["Error"] != null)
+{
+    <div class="alert-danger mb-4"><svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg><span>@ViewData["Error"]</span></div>
+}
+
+<!-- Header card -->
+<div class="card mb-4">
+    <div class="flex items-start justify-between flex-wrap gap-4">
+        <div>
+            <div class="flex items-center flex-wrap gap-2 mb-2">
+                @{
+                    var sc = p.Status switch {
+                        PermitStatus.Active               => "status-active",
+                        PermitStatus.Suspended            => "status-suspended",
+                        PermitStatus.Rejected             => "status-rejected",
+                        PermitStatus.Closed               => "status-draft",
+                        PermitStatus.WaitingHSEReview     => "status-review",
+                        PermitStatus.WaitingAreaApproval  => "status-review",
+                        PermitStatus.WaitingFinalApproval => "status-review",
+                        PermitStatus.Draft                => "status-draft",
+                        _                                 => "badge-gray"
+                    };
+                    var rc = p.RiskLevel switch { RiskLevel.Low => "risk-low", RiskLevel.Medium => "risk-medium", RiskLevel.High => "risk-high", _ => "risk-critical" };
+                }
+                <span class="@sc text-sm font-semibold">@p.Status</span>
+                <span class="@rc">@p.RiskLevel Risk</span>
+                <span class="badge-blue">@p.WorkType</span>
+            </div>
+            <h2 class="text-xl font-bold font-mono text-gray-900">@p.PermitNumber</h2>
+            <p class="text-gray-500 mt-1">📍 @p.Location @(!string.IsNullOrEmpty(p.SpecificArea) ? $"— {p.SpecificArea}" : "")</p>
+            <p class="text-gray-400 text-sm mt-1">
+                🕐 @p.StartTime.ToLocalTime().ToString("dd MMM yyyy HH:mm") → @p.EndTime.ToLocalTime().ToString("dd MMM yyyy HH:mm")
+                @if (p.Status == PermitStatus.Active)
+                {
+                    <span class="ml-2 text-red-600 font-mono font-bold" id="permitCountdown"></span>
+                }
+            </p>
+        </div>
+
+        <!-- Action buttons -->
+        <div class="flex flex-wrap gap-2">
+            @if (Model.CanSubmit)
+            {
+                <form method="post" asp-page-handler="Submit" asp-route-id="@p.Id">
+                    @Html.AntiForgeryToken()
+                    <button type="submit" class="btn-primary">▶ Submit</button>
+                </form>
+            }
+            @if (Model.CanApprove)
+            {
+                <button onclick="document.getElementById('approveModal').classList.remove('hidden')"
+                        class="btn-success @(!Model.IsApproverEligible ? "opacity-50 cursor-not-allowed" : "")"
+                        @(!Model.IsApproverEligible ? "disabled title=Sertifikasi tidak valid" : "")>
+                    ✓ Approve
+                </button>
+                <button onclick="document.getElementById('rejectModal').classList.remove('hidden')"
+                        class="btn-danger">✗ Tolak</button>
+            }
+            @if (Model.CanSuspend)
+            {
+                <button onclick="document.getElementById('suspendModal').classList.remove('hidden')"
+                        class="btn-warning">⏸ Suspend</button>
+            }
+            @if (Model.CanEmergencyStop)
+            {
+                <button onclick="document.getElementById('emergencyModal').classList.remove('hidden')"
+                        class="btn-danger bg-red-800 hover:bg-red-900">🚨 Emergency Stop</button>
+            }
+            @if (Model.CanResume)
+            {
+                <form method="post" asp-page-handler="Resume" asp-route-id="@p.Id">
+                    @Html.AntiForgeryToken()
+                    <button type="submit" class="btn-success">▶ Resume</button>
+                </form>
+            }
+            @if (Model.CanClose)
+            {
+                <button onclick="document.getElementById('closeModal').classList.remove('hidden')"
+                        class="btn-outline text-gray-700">✓ Tutup Permit</button>
+            }
+            @if (p.Status == PermitStatus.Active)
+            {
+                <a asp-page="/Permits/PAI" asp-route-id="@p.Id" class="btn-outline">📋 PAI</a>
+                <a asp-page="/Permits/Adherence" asp-route-id="@p.Id" class="btn-outline">⏰ Adherence</a>
+            }
+            <a asp-page="/Permits/Index" class="btn-outline">← Kembali</a>
+        </div>
+    </div>
+</div>
+
+<!-- Approval flow -->
+@if (p.Approvals.Any())
+{
+    <div class="card mb-4">
+        <h3 class="section-title">Alur Approval</h3>
+        <div class="flex items-center gap-0 overflow-x-auto pb-2">
+            @foreach (var step in p.Approvals.OrderBy(a => a.Sequence))
+            {
+                <div class="flex items-center">
+                    <div class="flex flex-col items-center min-w-36">
+                        <div class="w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold mb-2
+                             @(step.Status == ApprovalStatus.Approved ? "bg-green-500 text-white" :
+                               step.Status == ApprovalStatus.Rejected ? "bg-red-500 text-white" :
+                               step.Status == ApprovalStatus.Pending  ? "bg-yellow-400 text-white" :
+                                                                          "bg-gray-200 text-gray-500")">
+                            @(step.Status == ApprovalStatus.Approved ? "✓" :
+                              step.Status == ApprovalStatus.Rejected ? "✗" : step.Sequence.ToString())
+                        </div>
+                        <p class="text-xs font-medium text-gray-700 text-center">@step.RequiredRole</p>
+                        @if (step.ApprovedAt.HasValue)
+                        {
+                            <p class="text-xs text-gray-400">@step.ApprovedAt.Value.ToLocalTime().ToString("dd MMM HH:mm")</p>
+                        }
+                        @if (!string.IsNullOrEmpty(step.Comments))
+                        {
+                            <p class="text-xs text-gray-500 italic text-center max-w-28">@step.Comments</p>
+                        }
+                    </div>
+                    @if (step.Sequence < p.Approvals.Max(a => a.Sequence))
+                    {
+                        <div class="w-12 h-0.5 @(step.Status == ApprovalStatus.Approved ? "bg-green-400" : "bg-gray-200") flex-shrink-0"></div>
+                    }
+                </div>
+            }
+        </div>
+
+        @if (!Model.IsApproverEligible && Model.CurrentApprovalStep != null && User.IsInRole(Model.CurrentApprovalStep.RequiredRole))
+        {
+            <div class="alert-danger mt-3">
+                <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+                <strong>Anda tidak dapat menyetujui permit ini.</strong> Sertifikasi Anda untuk jenis pekerjaan <strong>@p.WorkType</strong> tidak valid atau sudah expired. Hubungi admin untuk memperbarui sertifikasi.
+            </div>
+        }
+    </div>
+}
+
+<!-- Grid info -->
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+
+    <!-- Workers -->
+    <div class="card">
+        <h3 class="section-title">Daftar Pekerja (@p.Workers.Count orang)</h3>
+        @if (!p.Workers.Any())
+        {
+            <p class="text-gray-400 text-sm">Tidak ada pekerja terdaftar.</p>
+        }
+        else
+        {
+            <div class="table-container">
+                <table class="table text-xs">
+                    <thead>
+                        <tr><th>Nama</th><th>Perusahaan</th><th>Jabatan</th><th>Check In</th><th>Check Out</th></tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var w in p.Workers)
+                        {
+                            <tr>
+                                <td class="font-medium">@w.WorkerName</td>
+                                <td>@(w.Company ?? "-")</td>
+                                <td>@(w.Position ?? "-")</td>
+                                <td>@(w.CheckInTime?.ToLocalTime().ToString("HH:mm") ?? "—")</td>
+                                <td>@(w.CheckOutTime?.ToLocalTime().ToString("HH:mm") ?? "—")</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+    </div>
+
+    <!-- PAI Status -->
+    <div class="card">
+        <h3 class="section-title">Status PAI</h3>
+        @if (!p.PAIChecklists.Any())
+        {
+            <div class="flex flex-col items-center py-6 text-gray-300">
+                <p class="text-gray-400 text-sm">PAI belum dilakukan</p>
+                @if (p.Status != PermitStatus.Draft && p.Status != PermitStatus.Submitted)
+                {
+                    <a asp-page="/Permits/PAI" asp-route-id="@p.Id"
+                       class="mt-3 btn-primary btn-sm">Lakukan PAI Sekarang</a>
+                }
+            </div>
+        }
+        else
+        {
+            var lastPAI = p.PAIChecklists.OrderByDescending(x => x.InspectionDate).First();
+            <div class="space-y-2 text-sm">
+                <div class="flex justify-between"><span class="text-gray-500">Area Aman</span><span class="@(lastPAI.AreaConditionSafe ? "text-green-600" : "text-red-600") font-medium">@(lastPAI.AreaConditionSafe ? "✓ Ya" : "✗ Tidak")</span></div>
+                <div class="flex justify-between"><span class="text-gray-500">APAR Tersedia</span><span class="@(lastPAI.FireExtinguisherAvailable ? "text-green-600" : "text-red-600") font-medium">@(lastPAI.FireExtinguisherAvailable ? "✓ Ya" : "✗ Tidak")</span></div>
+                <div class="flex justify-between"><span class="text-gray-500">Gas Test Valid</span><span class="@(lastPAI.GasTestValid ? "text-green-600" : "text-red-600") font-medium">@(lastPAI.GasTestValid ? "✓ Ya" : "✗ Tidak")</span></div>
+                <div class="flex justify-between"><span class="text-gray-500">APD Lengkap</span><span class="@(lastPAI.PPEComplete ? "text-green-600" : "text-red-600") font-medium">@(lastPAI.PPEComplete ? "✓ Ya" : "✗ Tidak")</span></div>
+                <div class="flex justify-between"><span class="text-gray-500">Isolasi Verified</span><span class="@(lastPAI.IsolationVerified ? "text-green-600" : "text-red-600") font-medium">@(lastPAI.IsolationVerified ? "✓ Ya" : "✗ Tidak")</span></div>
+                <div class="border-t pt-2 mt-2 flex justify-between font-semibold">
+                    <span>Overall</span>
+                    <span class="@(lastPAI.IsAllPassed ? "text-green-600" : "text-red-600")">
+                        @(lastPAI.IsAllPassed ? "✓ PASSED" : "✗ FAILED")
+                    </span>
+                </div>
+                <p class="text-xs text-gray-400">Diperiksa: @lastPAI.InspectorName — @lastPAI.InspectionDate.ToLocalTime().ToString("dd MMM HH:mm")</p>
+            </div>
+        }
+    </div>
+</div>
+
+<!-- Adherence Logs -->
+@if (p.AdherenceLogs.Any())
+{
+    <div class="card mb-4">
+        <h3 class="section-title">Log Adherence</h3>
+        <div class="table-container">
+            <table class="table text-xs">
+                <thead><tr><th>Waktu</th><th>Observer</th><th>Hasil</th><th>Observasi</th></tr></thead>
+                <tbody>
+                    @foreach (var log in p.AdherenceLogs.OrderByDescending(l => l.CheckTime))
+                    {
+                        <tr>
+                            <td>@log.CheckTime.ToLocalTime().ToString("dd MMM HH:mm")</td>
+                            <td>@log.ObserverName</td>
+                            <td><span class="@(log.IsCompliant ? "badge-green" : "badge-red")">@(log.IsCompliant ? "Compliant" : "Non-Compliant")</span></td>
+                            <td>@(log.UnsafeObservation ?? "-")</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    </div>
+}
+
+<!-- MODALS -->
+
+<!-- Approve Modal -->
+<div id="approveModal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md">
+        <h3 class="font-bold text-lg mb-4 text-green-700">✓ Approve Permit</h3>
+        <form method="post" asp-page-handler="Approve" asp-route-id="@p.Id">
+            @Html.AntiForgeryToken()
+            <label class="form-label">Komentar (opsional)</label>
+            <textarea asp-for="ApprovalComments" class="form-textarea mb-4" rows="3" placeholder="Catatan approval..."></textarea>
+            <div class="flex gap-3 justify-end">
+                <button type="button" onclick="document.getElementById('approveModal').classList.add('hidden')" class="btn-outline">Batal</button>
+                <button type="submit" class="btn-success">✓ Konfirmasi Approve</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Reject Modal -->
+<div id="rejectModal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md">
+        <h3 class="font-bold text-lg mb-4 text-red-700">✗ Tolak Permit</h3>
+        <form method="post" asp-page-handler="Reject" asp-route-id="@p.Id">
+            @Html.AntiForgeryToken()
+            <label class="form-label">Alasan penolakan <span class="text-red-500">*</span></label>
+            <textarea asp-for="RejectionReason" class="form-textarea mb-4" rows="3" required placeholder="Jelaskan alasan penolakan..."></textarea>
+            <div class="flex gap-3 justify-end">
+                <button type="button" onclick="document.getElementById('rejectModal').classList.add('hidden')" class="btn-outline">Batal</button>
+                <button type="submit" class="btn-danger">✗ Tolak</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Suspend Modal -->
+<div id="suspendModal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md">
+        <h3 class="font-bold text-lg mb-4 text-yellow-700">⏸ Suspend Permit</h3>
+        <form method="post" asp-page-handler="Suspend" asp-route-id="@p.Id">
+            @Html.AntiForgeryToken()
+            <label class="form-label">Alasan suspend <span class="text-red-500">*</span></label>
+            <textarea asp-for="SuspendReason" class="form-textarea mb-4" rows="3" required placeholder="Mengapa pekerjaan perlu disuspend?"></textarea>
+            <div class="flex gap-3 justify-end">
+                <button type="button" onclick="document.getElementById('suspendModal').classList.add('hidden')" class="btn-outline">Batal</button>
+                <button type="submit" class="btn-warning">⏸ Suspend</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Close Modal -->
+<div id="closeModal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md">
+        <h3 class="font-bold text-lg mb-4">Tutup Permit</h3>
+        <form method="post" asp-page-handler="Close" asp-route-id="@p.Id">
+            @Html.AntiForgeryToken()
+            <label class="form-label">Keterangan penutupan</label>
+            <textarea asp-for="CloseReason" class="form-textarea mb-4" rows="3" placeholder="Pekerjaan telah selesai / alasan penutupan..."></textarea>
+            <div class="flex gap-3 justify-end">
+                <button type="button" onclick="document.getElementById('closeModal').classList.add('hidden')" class="btn-outline">Batal</button>
+                <button type="submit" class="btn-primary">Tutup Permit</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Emergency Modal -->
+<div id="emergencyModal" class="hidden fixed inset-0 bg-red-900/80 flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md border-4 border-red-600">
+        <div class="text-center mb-4">
+            <div class="text-5xl mb-2">🚨</div>
+            <h3 class="font-bold text-xl text-red-700">EMERGENCY STOP</h3>
+            <p class="text-sm text-gray-600 mt-1">Semua pekerja akan diberi tahu dan pekerjaan dihentikan segera.</p>
+        </div>
+        <form method="post" asp-page-handler="EmergencyStop" asp-route-id="@p.Id">
+            @Html.AntiForgeryToken()
+            <label class="form-label">Alasan emergency stop <span class="text-red-500">*</span></label>
+            <textarea asp-for="SuspendReason" class="form-textarea mb-4 border-red-300" rows="3" required
+                      placeholder="Bahaya yang teridentifikasi..."></textarea>
+            <div class="flex gap-3 justify-end">
+                <button type="button" onclick="document.getElementById('emergencyModal').classList.add('hidden')" class="btn-outline">Batal</button>
+                <button type="submit" class="btn-danger bg-red-700 hover:bg-red-800">🚨 HENTIKAN SEKARANG</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+@section Scripts {
+<script>
+@if (Model.Permit.Status == PermitStatus.Active)
+{
+    <text>startCountdown('@Model.Permit.EndTime.ToString("o")', 'permitCountdown');</text>
+}
+</script>
+}
+```
+
+---
+
+## BAGIAN B — My Approvals Page
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/MyApprovals.cshtml.cs`
+
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+using Microsoft.EntityFrameworkCore;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Enums;
+using PTW.JSEA.Infrastructure.Data;
+
+namespace PTW.JSEA.Web.Pages.Permits;
+
+[Authorize(Roles = "HSEOfficer,AreaOwner,Approver,SafetyManager,SystemAdmin")]
+public class MyApprovalsModel : PageModel
+{
+    private readonly ApplicationDbContext _context;
+    private readonly UserManager<ApplicationUser> _userManager;
+
+    public MyApprovalsModel(ApplicationDbContext context, UserManager<ApplicationUser> userManager)
+    {
+        _context     = context;
+        _userManager = userManager;
+    }
+
+    public List<ApprovalQueueDto> Queue { get; set; } = new();
+
+    public async Task OnGetAsync()
+    {
+        var user  = await _userManager.GetUserAsync(User);
+        var roles = await _userManager.GetRolesAsync(user!);
+
+        // Tampilkan permit yang menunggu approval sesuai role user
+        var pendingPermits = await _context.WorkPermits
+            .Include(p => p.Requester)
+            .Include(p => p.Approvals)
+            .Include(p => p.JSEA)
+            .Where(p => p.Approvals.Any(a =>
+                a.Status == ApprovalStatus.Pending &&
+                roles.Contains(a.RequiredRole)))
+            .Where(p => p.Status != PermitStatus.Draft &&
+                        p.Status != PermitStatus.Active &&
+                        p.Status != PermitStatus.Closed &&
+                        p.Status != PermitStatus.Rejected)
+            .OrderBy(p => p.CreatedAt)
+            .ToListAsync();
+
+        Queue = pendingPermits.Select(p =>
+        {
+            var myStep = p.Approvals
+                .Where(a => a.Status == ApprovalStatus.Pending && roles.Contains(a.RequiredRole))
+                .OrderBy(a => a.Sequence)
+                .FirstOrDefault();
+            return new ApprovalQueueDto
+            {
+                PermitId      = p.Id,
+                PermitNumber  = p.PermitNumber,
+                WorkType      = p.WorkType.ToString(),
+                Location      = p.Location,
+                RiskLevel     = p.RiskLevel.ToString(),
+                RequesterName = p.Requester?.FullName ?? "-",
+                SubmittedAt   = p.UpdatedAt ?? p.CreatedAt,
+                ApprovalStep  = myStep?.RequiredRole ?? "",
+                Sequence      = myStep?.Sequence ?? 0
+            };
+        }).ToList();
+    }
+
+    public class ApprovalQueueDto
+    {
+        public int PermitId { get; set; }
+        public string PermitNumber { get; set; } = string.Empty;
+        public string WorkType { get; set; } = string.Empty;
+        public string Location { get; set; } = string.Empty;
+        public string RiskLevel { get; set; } = string.Empty;
+        public string RequesterName { get; set; } = string.Empty;
+        public DateTime SubmittedAt { get; set; }
+        public string ApprovalStep { get; set; } = string.Empty;
+        public int Sequence { get; set; }
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/MyApprovals.cshtml`
+
+```html
+@page
+@model PTW.JSEA.Web.Pages.Permits.MyApprovalsModel
+@{
+    ViewData["Title"] = "Approval Queue";
+}
+
+<div class="page-header">
+    <div>
+        <h2 class="page-title">Approval Queue</h2>
+        <p class="text-sm text-gray-500">Permit menunggu approval Anda</p>
+    </div>
+    <span class="badge-yellow text-base px-4 py-2">@Model.Queue.Count pending</span>
+</div>
+
+@if (!Model.Queue.Any())
+{
+    <div class="card">
+        <div class="flex flex-col items-center py-16 text-gray-300">
+            <svg class="w-16 h-16 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            <p class="text-gray-400 font-medium">Tidak ada permit yang perlu di-approve</p>
+        </div>
+    </div>
+}
+else
+{
+    <div class="space-y-3">
+        @foreach (var item in Model.Queue)
+        {
+            <div class="card hover:shadow-md transition-shadow">
+                <div class="flex items-start justify-between flex-wrap gap-3">
+                    <div>
+                        <div class="flex items-center gap-2 mb-1 flex-wrap">
+                            <span class="font-mono font-bold text-blue-700">@item.PermitNumber</span>
+                            <span class="badge-blue text-xs">@item.WorkType.Replace("WorkingAtHeight","At Height")</span>
+                            @{var rc = item.RiskLevel switch { "Low" => "risk-low", "Medium" => "risk-medium", "High" => "risk-high", _ => "risk-critical" };}
+                            <span class="@rc">@item.RiskLevel</span>
+                            <span class="badge-yellow text-xs">Step @item.Sequence: @item.ApprovalStep</span>
+                        </div>
+                        <p class="font-semibold text-gray-900">📍 @item.Location</p>
+                        <p class="text-sm text-gray-500 mt-1">
+                            Pemohon: @item.RequesterName ·
+                            Disubmit: @item.SubmittedAt.ToLocalTime().ToString("dd MMM yyyy HH:mm")
+                        </p>
+                    </div>
+                    <div class="flex gap-2">
+                        <a asp-page="/Permits/Detail" asp-route-id="@item.PermitId"
+                           class="btn-primary btn-sm">Lihat & Approve →</a>
+                    </div>
+                </div>
+            </div>
+        }
+    </div>
+}
+```
+
+---
+
+# ══════════════════════════════════════════════════════
+# MODUL 8 — PAI CHECKLIST & ADHERENCE
+# ══════════════════════════════════════════════════════
+
+## FILE: `src/PTW.JSEA.Web/Pages/Permits/PAI.cshtml.cs`
+
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+using PTW.JSEA.Application.Services;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Interfaces.Repositories;
+
+namespace PTW.JSEA.Web.Pages.Permits;
+
+[Authorize(Roles = "HSEOfficer,AreaOwner,SystemAdmin,SafetyManager")]
+public class PAIModel : PageModel
+{
+    private readonly IWorkPermitRepository _permitRepo;
+    private readonly IFileStorageService _fileStorage;
+    private readonly IAuditService _auditService;
+    private readonly UserManager<ApplicationUser> _userManager;
+    private readonly Infrastructure.Data.ApplicationDbContext _context;
+
+    public PAIModel(
+        IWorkPermitRepository permitRepo,
+        IFileStorageService fileStorage,
+        IAuditService auditService,
+        UserManager<ApplicationUser> userManager,
+        Infrastructure.Data.ApplicationDbContext context)
+    {
+        _permitRepo  = permitRepo;
+        _fileStorage = fileStorage;
+        _auditService= auditService;
+        _userManager = userManager;
+        _context     = context;
+    }
+
+    public WorkPermit Permit { get; set; } = null!;
+    [BindProperty] public PAIInputModel Input { get; set; } = new();
+
+    public class PAIInputModel
+    {
+        public bool AreaConditionSafe { get; set; }
+        public bool FireExtinguisherAvailable { get; set; }
+        public bool GasTestValid { get; set; }
+        public bool PPEComplete { get; set; }
+        public bool IsolationVerified { get; set; }
+        public bool BarricadeInstalled { get; set; }
+        public bool EmergencyExitClear { get; set; }
+        public bool CommunicationReady { get; set; }
+        public string? Notes { get; set; }
+        public IFormFile? Photo1 { get; set; }
+        public IFormFile? Photo2 { get; set; }
+        public IFormFile? Photo3 { get; set; }
+    }
+
+    public async Task<IActionResult> OnGetAsync(int id)
+    {
+        var permit = await _permitRepo.GetWithDetailsAsync(id);
+        if (permit == null) return NotFound();
+        Permit = permit;
+        return Page();
+    }
+
+    public async Task<IActionResult> OnPostAsync(int id)
+    {
+        var permit = await _permitRepo.GetByIdAsync(id);
+        if (permit == null) return NotFound();
+        Permit = (await _permitRepo.GetWithDetailsAsync(id))!;
+
+        var user = await _userManager.GetUserAsync(User);
+        var allowedImages = new[] { ".jpg", ".jpeg", ".png" };
+
+        string? photo1Path = null, photo2Path = null, photo3Path = null;
+        if (Input.Photo1 != null && _fileStorage.IsValidFile(Input.Photo1, allowedImages))
+            photo1Path = await _fileStorage.SaveFileAsync(Input.Photo1, $"pai/{id}");
+        if (Input.Photo2 != null && _fileStorage.IsValidFile(Input.Photo2, allowedImages))
+            photo2Path = await _fileStorage.SaveFileAsync(Input.Photo2, $"pai/{id}");
+        if (Input.Photo3 != null && _fileStorage.IsValidFile(Input.Photo3, allowedImages))
+            photo3Path = await _fileStorage.SaveFileAsync(Input.Photo3, $"pai/{id}");
+
+        var checklist = new PAIChecklist
+        {
+            PermitId                  = id,
+            AreaConditionSafe         = Input.AreaConditionSafe,
+            FireExtinguisherAvailable = Input.FireExtinguisherAvailable,
+            GasTestValid              = Input.GasTestValid,
+            PPEComplete               = Input.PPEComplete,
+            IsolationVerified         = Input.IsolationVerified,
+            BarricadeInstalled        = Input.BarricadeInstalled,
+            EmergencyExitClear        = Input.EmergencyExitClear,
+            CommunicationReady        = Input.CommunicationReady,
+            Notes                     = Input.Notes,
+            PhotoPath1                = photo1Path,
+            PhotoPath2                = photo2Path,
+            PhotoPath3                = photo3Path,
+            InspectorId               = user!.Id,
+            InspectorName             = user.FullName,
+            InspectionDate            = DateTime.UtcNow,
+            CreatedAt                 = DateTime.UtcNow
+        };
+
+        _context.PAIChecklists.Add(checklist);
+
+        // Mark PAI completed on permit
+        permit.PAICompleted   = true;
+        permit.PAICompletedAt = DateTime.UtcNow;
+        _context.WorkPermits.Update(permit);
+
+        await _context.SaveChangesAsync();
+        await _auditService.LogAsync("PAI", id, "PAICompleted", user.Id);
+
+        TempData["Success"] = "PAI berhasil disimpan.";
+        return RedirectToPage("/Permits/Detail", new { id });
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/PAI.cshtml`
+
+```html
+@page "{id:int}"
+@model PTW.JSEA.Web.Pages.Permits.PAIModel
+@{
+    ViewData["Title"] = "Pre-Authorization Inspection (PAI)";
+    var p = Model.Permit;
+}
+
+<div class="page-header">
+    <div>
+        <h2 class="page-title">PAI — @p.PermitNumber</h2>
+        <p class="text-sm text-gray-500">Pre-Authorization Inspection · @p.Location</p>
+    </div>
+    <a asp-page="/Permits/Detail" asp-route-id="@p.Id" class="btn-outline">← Kembali ke Permit</a>
+</div>
+
+<form method="post" enctype="multipart/form-data">
+    @Html.AntiForgeryToken()
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div class="lg:col-span-2 space-y-6">
+
+            <!-- Checklist -->
+            <div class="card">
+                <h3 class="section-title">Checklist Inspeksi</h3>
+                <p class="text-sm text-gray-500 mb-5">Centang semua kondisi yang telah diverifikasi di lapangan:</p>
+
+                @{
+                    var items = new[]
+                    {
+                        ("Input.AreaConditionSafe",          "Kondisi area kerja aman", "Tidak ada bahaya fisik yang belum dikendalikan"),
+                        ("Input.FireExtinguisherAvailable",  "APAR tersedia dan berfungsi", "Fire extinguisher dalam jangkauan area kerja"),
+                        ("Input.GasTestValid",               "Gas test valid (jika diperlukan)", "Hasil gas detector dalam batas aman"),
+                        ("Input.PPEComplete",                "APD lengkap tersedia", "Semua pekerja memiliki APD sesuai jenis pekerjaan"),
+                        ("Input.IsolationVerified",          "Isolation/LOTO terverifikasi", "Energi berbahaya telah di-isolasi sesuai prosedur"),
+                        ("Input.BarricadeInstalled",         "Barikade/rambu terpasang", "Area kerja telah dibatasi dan diberi rambu peringatan"),
+                        ("Input.EmergencyExitClear",         "Jalur evakuasi bersih", "Akses menuju assembly point tidak terhalang"),
+                        ("Input.CommunicationReady",         "Komunikasi siap", "Radio/HP berfungsi, frekuensi emergency sudah diketahui")
+                    };
+                }
+
+                <div class="space-y-3">
+                    @foreach (var (forAttr, label, desc) in items)
+                    {
+                        <label class="flex items-start gap-4 p-4 bg-gray-50 rounded-xl hover:bg-blue-50 cursor-pointer transition-colors group">
+                            <input type="checkbox" name="@forAttr" value="true"
+                                   class="mt-0.5 w-5 h-5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 flex-shrink-0"/>
+                            <div>
+                                <p class="font-medium text-gray-900 group-hover:text-blue-800">@label</p>
+                                <p class="text-xs text-gray-500 mt-0.5">@desc</p>
+                            </div>
+                        </label>
+                    }
+                </div>
+
+                <div class="mt-5">
+                    <label class="form-label">Catatan Inspeksi</label>
+                    <textarea asp-for="Input.Notes" class="form-textarea" rows="3"
+                              placeholder="Catatan temuan lapangan, kondisi khusus, atau hal yang perlu diperhatikan..."></textarea>
+                </div>
+            </div>
+
+            <!-- Photo Upload -->
+            <div class="card">
+                <h3 class="section-title">Foto Bukti Inspeksi</h3>
+                <p class="text-sm text-gray-500 mb-4">Upload minimal 1 foto sebagai bukti inspeksi lapangan. Format: JPG, PNG. Max 5MB.</p>
+
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    @for (int i = 1; i <= 3; i++)
+                    {
+                        <div class="border-2 border-dashed border-gray-200 rounded-xl p-4 text-center hover:border-blue-300 transition-colors">
+                            <div id="preview-@i" class="hidden mb-2">
+                                <img id="img-@i" class="w-full h-28 object-cover rounded-lg"/>
+                            </div>
+                            <svg id="icon-@i" class="w-10 h-10 text-gray-300 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/>
+                            </svg>
+                            <p class="text-xs text-gray-400 mb-2">Foto @i</p>
+                            <label class="btn-outline btn-sm cursor-pointer text-xs">
+                                Pilih Foto
+                                <input name="Input.Photo@i" type="file" accept=".jpg,.jpeg,.png"
+                                       class="hidden" onchange="previewImage(this, @i)"/>
+                            </label>
+                        </div>
+                    }
+                </div>
+            </div>
+        </div>
+
+        <!-- Sidebar -->
+        <div class="space-y-4">
+            <div class="card border-blue-200 bg-blue-50">
+                <h4 class="font-semibold text-blue-800 mb-3 text-sm">📋 Informasi Permit</h4>
+                <div class="space-y-2 text-xs text-blue-700">
+                    <div><span class="font-medium">No:</span> @p.PermitNumber</div>
+                    <div><span class="font-medium">Jenis:</span> @p.WorkType</div>
+                    <div><span class="font-medium">Lokasi:</span> @p.Location</div>
+                    <div><span class="font-medium">Pekerja:</span> @p.Workers.Count orang</div>
+                    <div><span class="font-medium">Mulai:</span> @p.StartTime.ToLocalTime().ToString("dd MMM HH:mm")</div>
+                </div>
+            </div>
+
+            <div class="card border-red-200 bg-red-50">
+                <h4 class="font-semibold text-red-800 mb-2 text-sm">⚠️ Penting</h4>
+                <p class="text-xs text-red-700">
+                    PAI harus dilakukan sebelum pekerjaan dimulai. Inspector bertanggung jawab atas keakuratan data ini.
+                    Data PAI akan direkam dalam audit trail.
+                </p>
+            </div>
+
+            <button type="submit" class="btn-success w-full btn-lg">
+                ✓ Simpan Hasil PAI
+            </button>
+        </div>
+    </div>
+</form>
+
+@section Scripts {
+<script>
+function previewImage(input, idx) {
+    if (input.files && input.files[0]) {
+        const reader = new FileReader();
+        reader.onload = e => {
+            document.getElementById(`img-${idx}`).src = e.target.result;
+            document.getElementById(`preview-${idx}`).classList.remove('hidden');
+            document.getElementById(`icon-${idx}`).classList.add('hidden');
+        };
+        reader.readAsDataURL(input.files[0]);
+    }
+}
+</script>
+}
+```
+
+---
+
+## FILE: `src/PTW.JSEA.Web/Pages/Permits/Adherence.cshtml.cs`
+
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+using PTW.JSEA.Domain.Entities;
+using PTW.JSEA.Domain.Interfaces.Repositories;
+using PTW.JSEA.Infrastructure.Data;
+
+namespace PTW.JSEA.Web.Pages.Permits;
+
+[Authorize]
+public class AdherenceModel : PageModel
+{
+    private readonly IWorkPermitRepository _permitRepo;
+    private readonly UserManager<ApplicationUser> _userManager;
+    private readonly ApplicationDbContext _context;
+
+    public AdherenceModel(
+        IWorkPermitRepository permitRepo,
+        UserManager<ApplicationUser> userManager,
+        ApplicationDbContext context)
+    {
+        _permitRepo  = permitRepo;
+        _userManager = userManager;
+        _context     = context;
+    }
+
+    public WorkPermit Permit { get; set; } = null!;
+    [BindProperty] public AdherenceInputModel Input { get; set; } = new();
+
+    public class AdherenceInputModel
+    {
+        public bool IsCompliant { get; set; }
+        public string? UnsafeObservation { get; set; }
+        public string? CorrectiveAction { get; set; }
+        public string? Notes { get; set; }
+    }
+
+    public async Task<IActionResult> OnGetAsync(int id)
+    {
+        var permit = await _permitRepo.GetWithDetailsAsync(id);
+        if (permit == null) return NotFound();
+        Permit = permit;
+        return Page();
+    }
+
+    public async Task<IActionResult> OnPostAsync(int id)
+    {
+        var permit = await _permitRepo.GetByIdAsync(id);
+        if (permit == null) return NotFound();
+        Permit = (await _permitRepo.GetWithDetailsAsync(id))!;
+
+        var user = await _userManager.GetUserAsync(User);
+        var log  = new AdherenceLog
+        {
+            PermitId           = id,
+            CheckTime          = DateTime.UtcNow,
+            ObserverName       = user!.FullName,
+            ObserverId         = user.Id,
+            IsCompliant        = Input.IsCompliant,
+            UnsafeObservation  = Input.UnsafeObservation,
+            CorrectiveAction   = Input.CorrectiveAction,
+            Notes              = Input.Notes,
+            CreatedAt          = DateTime.UtcNow
+        };
+
+        _context.AdherenceLogs.Add(log);
+        await _context.SaveChangesAsync();
+
+        TempData["Success"] = "Log adherence berhasil disimpan.";
+        return RedirectToPage("/Permits/Detail", new { id });
+    }
+}
+```
+
+---
+
+### FILE: `src/PTW.JSEA.Web/Pages/Permits/Adherence.cshtml`
+
+```html
+@page "{id:int}"
+@model PTW.JSEA.Web.Pages.Permits.AdherenceModel
+@{
+    ViewData["Title"] = "Adherence Check";
+    var p = Model.Permit;
+}
+
+<div class="page-header">
+    <div>
+        <h2 class="page-title">Adherence Check — @p.PermitNumber</h2>
+        <p class="text-sm text-gray-500">Pemeriksaan kepatuhan berkala setiap 4 jam</p>
+    </div>
+    <a asp-page="/Permits/Detail" asp-route-id="@p.Id" class="btn-outline">← Kembali</a>
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <div class="lg:col-span-2">
+        <form method="post" class="card">
+            @Html.AntiForgeryToken()
+            <h3 class="section-title">Form Adherence</h3>
+            <p class="text-sm text-gray-500 mb-5">
+                Pemeriksaan ini dilakukan oleh <strong>@User.Identity?.Name</strong>
+                pada <strong>@DateTime.Now.ToString("dd MMMM yyyy HH:mm")</strong>
+            </p>
+
+            <div class="mb-5">
+                <p class="form-label mb-3">Status Kepatuhan <span class="text-red-500">*</span></p>
+                <div class="grid grid-cols-2 gap-3">
+                    <label class="flex items-center gap-3 p-4 border-2 border-green-200 bg-green-50 rounded-xl cursor-pointer hover:bg-green-100 transition-colors">
+                        <input type="radio" name="Input.IsCompliant" value="true" class="w-4 h-4 text-green-600"/>
+                        <div>
+                            <p class="font-semibold text-green-800">✓ Compliant</p>
+                            <p class="text-xs text-green-600">Pekerjaan sesuai permit dan prosedur</p>
+                        </div>
+                    </label>
+                    <label class="flex items-center gap-3 p-4 border-2 border-red-200 bg-red-50 rounded-xl cursor-pointer hover:bg-red-100 transition-colors">
+                        <input type="radio" name="Input.IsCompliant" value="false" class="w-4 h-4 text-red-600"/>
+                        <div>
+                            <p class="font-semibold text-red-800">✗ Non-Compliant</p>
+                            <p class="text-xs text-red-600">Ada penyimpangan dari permit/prosedur</p>
+                        </div>
+                    </label>
+                </div>
+            </div>
+
+            <div class="mb-4">
+                <label class="form-label">Unsafe Observation</label>
+                <textarea asp-for="Input.UnsafeObservation" class="form-textarea" rows="3"
+                          placeholder="Catat kondisi tidak aman yang ditemukan (jika ada)..."></textarea>
+            </div>
+
+            <div class="mb-4">
+                <label class="form-label">Tindakan Koreksi</label>
+                <textarea asp-for="Input.CorrectiveAction" class="form-textarea" rows="3"
+                          placeholder="Tindakan perbaikan yang telah dilakukan atau direncanakan..."></textarea>
+            </div>
+
+            <div class="mb-6">
+                <label class="form-label">Catatan Tambahan</label>
+                <textarea asp-for="Input.Notes" class="form-textarea" rows="2"
+                          placeholder="Catatan lainnya..."></textarea>
+            </div>
+
+            <button type="submit" class="btn-primary w-full btn-lg">✓ Simpan Log Adherence</button>
+        </form>
+    </div>
+
+    <div class="space-y-4">
+        <div class="card border-blue-200 bg-blue-50">
+            <h4 class="font-semibold text-blue-800 mb-3 text-sm">📋 Info Permit</h4>
+            <div class="space-y-1.5 text-xs text-blue-700">
+                <div><span class="font-medium">No:</span> @p.PermitNumber</div>
+                <div><span class="font-medium">Lokasi:</span> @p.Location</div>
+                <div><span class="font-medium">Selesai:</span> @p.EndTime.ToLocalTime().ToString("HH:mm")</div>
+                <div><span class="font-medium">Log terakhir:</span>
+                    @{
+                        var lastLog = p.AdherenceLogs.OrderByDescending(l => l.CheckTime).FirstOrDefault();
+                    }
+                    @(lastLog != null ? lastLog.CheckTime.ToLocalTime().ToString("HH:mm") : "Belum ada")
+                </div>
+            </div>
+        </div>
+
+        <!-- Log history -->
+        @if (p.AdherenceLogs.Any())
+        {
+            <div class="card">
+                <h4 class="font-semibold text-gray-700 mb-3 text-sm">Riwayat Adherence</h4>
+                <div class="space-y-2">
+                    @foreach (var log in p.AdherenceLogs.OrderByDescending(l => l.CheckTime).Take(5))
+                    {
+                        <div class="flex items-center justify-between text-xs">
+                            <span class="text-gray-500">@log.CheckTime.ToLocalTime().ToString("HH:mm")</span>
+                            <span class="@(log.IsCompliant ? "badge-green" : "badge-red")">@(log.IsCompliant ? "✓" : "✗")</span>
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+    </div>
+</div>
+```
+
+---
+
+### Tambahkan ke `DependencyInjection.cs` Application:
+
+```csharp
+services.AddScoped<IWorkPermitService, WorkPermitService>();
+```
+
+### Tambahkan ke `DependencyInjection.cs` Infrastructure:
+
+```csharp
+services.AddScoped<IDashboardNotifier, SignalRDashboardNotifier>();
+```
+
+---
+
+> ✅ Modul 6, 7, 8 selesai.
+> — Permit: Create, List, Detail, Submit, Approve, Reject, Suspend, Resume, Emergency Stop
+> — Authorization Engine: Sertifikat check, role check, digital signature
+> — PAI Checklist: Full form + photo upload
+> — Adherence: Log form + history
